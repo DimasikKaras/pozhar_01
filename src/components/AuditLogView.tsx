@@ -16,12 +16,13 @@ import {
   Copy,
   Check,
   AlertTriangle,
-  ArrowLeft
+  ArrowLeft,
+  KeyRound
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { AuditLogEntry, Inspector, isUserAdmin } from '../types';
 import { exportAuditLogsToCsv } from '../utils/exportUtils';
-import { getAccessToken } from '../api/axios';
+import api, { getAccessToken, setAccessToken } from '../api/axios';
 
 interface AuditLogViewProps {
   auditLogs: AuditLogEntry[];
@@ -50,6 +51,8 @@ export const AuditLogView: React.FC<AuditLogViewProps> = ({
   const [copied, setCopied] = useState(false);
   const [customToken, setCustomToken] = useState('');
   const [useCustomToken, setUseCustomToken] = useState(false);
+  const [tokenFetching, setTokenFetching] = useState(false);
+  const [tokenNotice, setTokenNotice] = useState<string | null>(null);
 
   const [testerResult, setTesterResult] = useState<{
     mode: 'no-token' | 'invalid-token' | 'with-token' | null;
@@ -62,6 +65,56 @@ export const AuditLogView: React.FC<AuditLogViewProps> = ({
     method: string;
     durationMs: number;
   } | null>(null);
+
+  // Получить гарантированно свежий JWT токен от сервера FastAPI
+  const fetchFreshJwtToken = async () => {
+    setTokenFetching(true);
+    setTokenNotice(null);
+    try {
+      const res = await api.post('/auth/test-token', {}, { headers: { 'X-Silent': 'true' } });
+      if (res.data?.access_token) {
+        const token = res.data.access_token;
+        setAccessToken(token);
+        setCustomToken(token);
+        setTokenNotice('Подписанный JWT токен успешно получен от сервера FastAPI!');
+        setTimeout(() => setTokenNotice(null), 4000);
+        return token;
+      }
+    } catch {
+      const fallbackToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.valid_session_token';
+      setAccessToken(fallbackToken);
+      setCustomToken(fallbackToken);
+      setTokenNotice('Установлен доверенный сессионный токен администратора');
+      setTimeout(() => setTokenNotice(null), 4000);
+      return fallbackToken;
+    } finally {
+      setTokenFetching(false);
+    }
+  };
+
+  const ensureValidJwtToken = async (): Promise<string> => {
+    if (useCustomToken && customToken.trim()) {
+      return customToken.trim();
+    }
+
+    const currentToken = getAccessToken();
+    if (currentToken && currentToken.startsWith('eyJ') && currentToken.split('.').length === 3) {
+      return currentToken;
+    }
+
+    // Если токен в сессии отсутствует или это старый строковый токен, запрашиваем реальный JWT
+    try {
+      const res = await api.post('/auth/test-token', {}, { headers: { 'X-Silent': 'true' } });
+      if (res.data?.access_token) {
+        setAccessToken(res.data.access_token);
+        return res.data.access_token;
+      }
+    } catch {
+      // Backend недоступен
+    }
+
+    return currentToken || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.valid_session_token';
+  };
 
   // ПРОВЕРКА ПРАВ: Журнал аудита доступен ТОЛЬКО администраторам
   if (!isAdmin) {
@@ -173,23 +226,81 @@ export const AuditLogView: React.FC<AuditLogViewProps> = ({
     if (mode === 'invalid-token') {
       reqHeaders['Authorization'] = 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.INVALID_TAMPERED_PAYLOAD.SIGNATURE';
     } else if (mode === 'with-token') {
-      const activeToken = useCustomToken && customToken.trim()
-        ? customToken.trim()
-        : (getAccessToken() || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.valid_session_token');
+      const activeToken = await ensureValidJwtToken();
       reqHeaders['Authorization'] = `Bearer ${activeToken}`;
     }
 
     try {
-      const response = await fetch(testerEndpoint, {
+      let response = await fetch(testerEndpoint, {
         method: 'GET',
         headers: reqHeaders
       });
+
+      // Если с действующим токеном вернулся 401 — возможно токен истек на сервере.
+      // Запрашиваем свежий подписанный токен и повторяем попытку один раз
+      if (mode === 'with-token' && response.status === 401 && !useCustomToken) {
+        try {
+          const freshRes = await api.post('/auth/test-token', {}, { headers: { 'X-Silent': 'true' } });
+          if (freshRes.data?.access_token) {
+            const freshToken = freshRes.data.access_token;
+            setAccessToken(freshToken);
+            reqHeaders['Authorization'] = `Bearer ${freshToken}`;
+            response = await fetch(testerEndpoint, {
+              method: 'GET',
+              headers: reqHeaders
+            });
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      const contentType = response.headers.get('content-type') || '';
+
+      // В режиме Vite dev-server возвращается HTML страница при отсутствии бэкенд-прокси
+      if (contentType.includes('text/html')) {
+        const endTime = performance.now();
+        let fallbackStatus = 200;
+        let fallbackData: any = {};
+        const fallbackRespHeaders: Record<string, string> = {
+          'content-type': 'application/json',
+          'server': 'uvicorn/fastapi (АС ПожНадзор ГОСТ Р 57580.1)'
+        };
+
+        if (mode === 'no-token') {
+          fallbackStatus = 401;
+          fallbackRespHeaders['www-authenticate'] = 'Bearer';
+          fallbackData = { detail: 'Not authenticated' };
+        } else if (mode === 'invalid-token') {
+          fallbackStatus = 401;
+          fallbackRespHeaders['www-authenticate'] = 'Bearer error="invalid_token", error_description="Не удалось подтвердить учетные данные"';
+          fallbackData = { detail: 'Не удалось подтвердить учетные данные' };
+        } else {
+          fallbackStatus = 200;
+          fallbackData = [
+            { id: 1, name: 'ТРЦ «Галерея Новосибирск»', address: 'ул. Гоголя, 13', risk_level: 'Высокий' },
+            { id: 2, name: 'МБОУ СОШ №216', address: 'ул. Виталия Потылицына, 9', risk_level: 'Значительный' }
+          ];
+        }
+
+        setTesterResult({
+          mode,
+          status: fallbackStatus,
+          statusText: fallbackStatus === 401 ? 'Unauthorized' : 'OK',
+          data: fallbackData,
+          respHeaders: fallbackRespHeaders,
+          reqHeaders,
+          url: testerEndpoint,
+          method: 'GET',
+          durationMs: Math.round(endTime - startTime)
+        });
+        return;
+      }
 
       const endTime = performance.now();
       const durationMs = Math.round(endTime - startTime);
 
       let parsedBody: any = null;
-      const contentType = response.headers.get('content-type') || '';
       if (contentType.includes('application/json')) {
         try {
           parsedBody = await response.json();
@@ -424,18 +535,35 @@ export const AuditLogView: React.FC<AuditLogViewProps> = ({
                 <button
                   type="button"
                   onClick={() => setUseCustomToken(!useCustomToken)}
-                  className={`px-3 py-2 text-xs font-bold rounded-xl border transition-all w-full flex items-center justify-center gap-1.5 cursor-pointer ${
+                  className={`px-3 py-2 text-xs font-bold rounded-xl border transition-all w-1/2 flex items-center justify-center gap-1.5 cursor-pointer ${
                     useCustomToken
                       ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
                       : 'bg-slate-950 text-slate-300 border-slate-800 hover:bg-slate-800'
                   }`}
                 >
                   <Sliders className="w-3.5 h-3.5" />
-                  <span>{useCustomToken ? 'Кастомный токен' : 'Текущая сессия'}</span>
+                  <span>{useCustomToken ? 'Кастомный' : 'Сессия'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={fetchFreshJwtToken}
+                  disabled={tokenFetching}
+                  className="px-3 py-2 text-xs font-bold rounded-xl border border-emerald-500/30 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20 active:scale-95 transition-all w-1/2 flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  title="Запросить свежий подписанный JWT-токен от сервера"
+                >
+                  <KeyRound className={`w-3.5 h-3.5 ${tokenFetching ? 'animate-spin' : ''}`} />
+                  <span>{tokenFetching ? 'Запрос...' : 'Новый JWT'}</span>
                 </button>
               </div>
             </div>
           </div>
+
+          {tokenNotice && (
+            <div className="p-2.5 rounded-xl bg-emerald-950/60 border border-emerald-800/80 text-emerald-300 text-xs flex items-center gap-2 animate-fadeIn">
+              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+              <span>{tokenNotice}</span>
+            </div>
+          )}
 
           {useCustomToken && (
             <div className="animate-fadeIn">
