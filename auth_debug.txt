@@ -1,0 +1,452 @@
+
+==================== FRONTEND LOGIN FLOW (src/App.tsx) ====================
+const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setSuccessMessage('');
+
+    const trimmedEmail = email.trim();
+
+    if (!isValidEmail(trimmedEmail)) {
+      setError('Пожалуйста, введите корректный адрес электронной почты (например, inspector@mchs.gov.ru)');
+      return;
+    }
+
+    if (mode === 'register') {
+      if (!isValidFullName(fullName)) {
+        setError('Пожалуйста, укажите корректное ФИО инспектора (минимум Фамилия и Имя, например: Иванов Иван Иванович)');
+        return;
+      }
+      if (!isValidStrongPassword(password)) {
+        setError('Пароль не отвечает требованиям безопасности: минимум 8 символов, хотя бы одна буква, одна цифра и один специальный символ (!@#$%^&*).');
+        return;
+      }
+
+      const trimmedPhone = phone.trim();
+      if (trimmedPhone && !isValidRussianPhone(trimmedPhone)) {
+        setError('Пожалуйста, введите корректный номер телефона РФ (например: +7 (999) 123-45-67)');
+        return;
+      }
+
+      const isDuplicate = existingInspectors.some(
+        (insp) => insp.email.trim().toLowerCase() === trimmedEmail.toLowerCase()
+      );
+
+      if (isDuplicate) {
+        setError(`Аккаунт с почтой "${trimmedEmail}" уже существует в системе. Выберите вкладку "Вход в систему".`);
+        return;
+      }
+
+      // Secure Master Key validation for Administrator role
+      let assignedRole: Role = role;
+      const trimmedCode = adminSecretCode.trim().toUpperCase();
+
+      if (role === 'Администратор' || trimmedCode.length > 0) {
+        if (masterKeyLockoutSeconds > 0) {
+          setError(`Превышено количество попыток ввода служебного кода. Повторите попытку через ${masterKeyLockoutSeconds} сек.`);
+          return;
+        }
+
+        const isMasterKeyValid = VALID_ADMIN_MASTER_KEYS.includes(trimmedCode);
+        if (!isMasterKeyValid) {
+          const nextAttempts = masterKeyAttempts + 1;
+          setMasterKeyAttempts(nextAttempts);
+          if (nextAttempts >= 3) {
+            setMasterKeyLockoutSeconds(30);
+            setMasterKeyAttempts(0);
+            setError('Превышено количество попыток. Ввод служебного кода заблокирован на 30 секунд.');
+          } else {
+            setError(`Ошибка допуска: недействительный служебный код (осталось попыток: ${3 - nextAttempts}).`);
+          }
+          return;
+        }
+
+        assignedRole = 'Администратор';
+        setMasterKeyAttempts(0);
+      }
+
+      // Generate standard RFC 6238 32-char Base32 2FA Credentials for Setup Wizard
+      const newSecret = generateBase32Secret(32);
+      const newBackupCodes = generateBackupRecoveryCodes(8);
+      const formattedPhone = trimmedPhone ? normalizePhoneNumber(trimmedPhone) : '+7 (999) 000-00-00';
+      const nextId = getNextSequentialId(existingInspectors);
+
+      const candidateUser: Inspector = {
+        id: nextId,
+        full_name: fullName.trim(),
+        rank,
+        phone: formattedPhone,
+        email: trimmedEmail,
+        role: assignedRole,
+        two_factor_enabled: true,
+        two_factor_method: register2FAMethod,
+        two_factor_secret: newSecret,
+        backup_codes: newBackupCodes
+      };
+
+      setSetup2FAUser(candidateUser);
+      setSetupSecret(newSecret);
+      setSetupBackupCodes(newBackupCodes);
+      setSetupInputCode('');
+
+      if (register2FAMethod === 'totp') {
+        const otpUrl = generateOtpAuthUrl(trimmedEmail, newSecret, 'PozhNadzor');
+        const qrUrl = await generateQrCodeDataUrl(otpUrl);
+        setSetupOtpUrl(otpUrl);
+        setSetupQrUrl(qrUrl);
+      } else {
+        // Email 2FA: send code to inspector's email immediately
+        issueEmailOtpCode(candidateUser);
+      }
+      return;
+    }
+
+    // LOGIN FLOW
+    setLoading(true);
+    try {
+      let found = existingInspectors.find(
+        (i) => i.email.trim().toLowerCase() === trimmedEmail.toLowerCase()
+      );
+
+      if (!found) {
+        try {
+          const res = await api.get('/inspectors');
+          if (Array.isArray(res.data)) {
+            const serverMatch = res.data.find(
+              (i: any) => i.email && i.email.trim().toLowerCase() === trimmedEmail.toLowerCase()
+            );
+            if (serverMatch) {
+              found = {
+                id: String(serverMatch.id),
+                full_name: serverMatch.full_name || 'Инспектор ГПН',
+                rank: serverMatch.rank || 'Лейтенант внутренней службы',
+                phone: serverMatch.phone || '+7 (999) 000-00-00',
+                email: serverMatch.email,
+                role: serverMatch.role || 'Инспектор',
+                two_factor_enabled: true,
+                two_factor_method: serverMatch.two_factor_method || 'email',
+                two_factor_secret: serverMatch.two_factor_secret,
+                backup_codes: serverMatch.backup_codes
+              };
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      if (found) {
+        // Prepare 2FA user data with fallback defaults
+        const secret = found.two_factor_secret || getDeterministicInspectorSecret(found.email);
+        const backupCodes = found.backup_codes && found.backup_codes.length > 0
+          ? found.backup_codes
+          : generateBackupRecoveryCodes(8);
+
+        const preferredMethod = found.two_factor_method || 'totp';
+
+        const preparedUser: Inspector = {
+          ...found,
+          two_factor_enabled: true,
+          two_factor_method: preferredMethod,
+          two_factor_secret: secret,
+          backup_codes: backupCodes
+        };
+
+        setTwoFactorPendingUser(preparedUser);
+        setTwoFactorTab(preferredMethod);
+        setTwoFactorInputCode('');
+
+        if (preferredMethod === 'email') {
+          issueEmailOtpCode(preparedUser);
+        }
+      } else {
+        setError(`Пользователь с адресом "${trimmedEmail}" не найден в реестре. Пожалуйста, пройдите регистрацию.`);
+      }
+    } catch (err: any) {
+      setError(err?.response?.data?.detail || 'Ошибка авторизации. Проверьте данные.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // VERIFY 2FA DURING LOGIN
+  const handleVerifyTwoFactor
+
+==================== BACKEND AUTH ROUTER (backend/app/routers/auth.py) ====================
+from datetime import UTC, datetime, timedelta, timezone
+import os, smtplib, random
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from pydantic import BaseModel, EmailStr
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from ..config import settings
+from ..database import get_db
+from ..models import Inspector, RefreshToken
+from ..schemas import InspectorOut, InspectorRegister, LoginRequest, TokenPairResponse
+from ..security import create_access_token, create_refresh_token, hash_password, hash_refresh_token, refresh_token_expiry, verify_password
+
+router = APIRouter(prefix='/auth', tags=['auth'])
+EMAIL_CODES: dict[str, dict] = {}
+
+class SendEmailCodeRequest(BaseModel):
+    email: str
+    inspectorName: str = 'Инспектор'
+
+class VerifyEmailCodeRequest(BaseModel):
+    email: str
+    code: str
+
+@router.post('/send-email-code')
+def send_email_code(payload: SendEmailCodeRequest):
+    clean_email = payload.email.strip().lower()
+    code = f"{random.randint(100000, 999999)}"
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+    EMAIL_CODES[clean_email] = {'code': code, 'expires_at': expires_at}
+
+    host = 'smtp.yandex.ru'
+    port = 465
+    user = 'Bykov8642@yandex.ru'
+    password = 'dqabciwhhmekfxdr'
+    real_mail_sent = False
+    smtp_error = None
+
+    try:
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = f'Код подтверждения 2FA: {code} — ПожНадзор.pro'
+        msg['From'] = user
+        msg['To'] = clean_email
+        html_body = f'''
+        <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 24px; border: 1px solid #e2e8f0; border-radius: 12px;">
+            <h2 style="color: #dc2626; margin: 0 0 10px;">ПожНадзор.pro</h2>
+            <p>Здравствуйте, <b>{payload.inspectorName}</b>!</p>
+            <p>Ваш проверочный код для входа в систему:</p>
+            <div style="background: #f8fafc; border: 2px dashed #dc2626; border-radius: 8px; padding: 18px; text-align: center; font-size: 32px; font-weight: 800; letter-spacing: 8px; color: #1e293b;">
+                {code}
+            </div>
+            <p style="color: #64748b; font-size: 13px; margin-top: 15px;">Код действителен 10 минут.</p>
+        </div>
+        '''
+        msg.attach(MIMEText(html_body, 'html', 'utf-8'))
+        with smtplib.SMTP_SSL(host, port, timeout=10) as server:
+            server.login(user, password)
+            server.send_message(msg)
+        real_mail_sent = True
+    except Exception as e:
+        smtp_error = str(e)
+
+    return {
+        'success': True,
+        'message': f'Код отправлен на {clean_email}' if real_mail_sent else f'Код: {code}',
+        'code': code,
+        'sentRealMail': real_mail_sent,
+        'deliveryDetails': {
+            'code': code,
+            'subject': f'Код подтверждения 2FA: {code} — ПожНадзор.pro',
+            'sentAt': datetime.now(timezone.utc).isoformat(),
+            'expiresAt': expires_at.isoformat(),
+            'realMailSent': real_mail_sent,
+            'smtpError': smtp_error,
+        },
+    }
+
+@router.post('/verify-email-code')
+def verify_email_code(payload: VerifyEmailCodeRequest):
+    clean_email = payload.email.strip().lower()
+    clean_code = payload.code.strip()
+    stored = EMAIL_CODES.get(clean_email)
+    if not stored:
+        return {'valid': False, 'message': 'Код не запрашивался или устарел'}
+    if datetime.now(timezone.utc) > stored['expires_at']:
+        del EMAIL_CODES[clean_email]
+        return {'valid': False, 'message': 'Срок действия кода истек'}
+    if stored['code'] == clean_code:
+        del EMAIL_CODES[clean_email]
+        return {'valid': True, 'message': 'Код успешно подтвержден'}
+    return {'valid': False, 'message': 'Неверный код'}
+
+@router.get('/smtp-status')
+def smtp_status():
+    return {'configured': True, 'type': 'custom', 'host': 'smtp.yandex.ru', 'user': 'Bykov8642@yandex.ru', 'from': 'Bykov8642@yandex.ru'}
+
+@router.post('/register', response_model=InspectorOut, status_code=status.HTTP_201_CREATED)
+def register(payload: InspectorRegister, db: Session = Depends(get_db)):
+    clean_email = str(payload.email).strip().lower()
+    existing = db.scalar(select(Inspector).where(Inspector.email == clean_email))
+    if existing:
+        existing.full_name = payload.full_name
+        existing.rank = payload.rank
+        existing.phone = payload.phone
+        existing.role = payload.role
+        existing.password_hash = hash_password(payload.password)
+        db.commit()
+        db.refresh(existing)
+        return existing
+
+    user = Inspector(
+        full_name=payload.full_name,
+        rank=payload.rank,
+        phone=payload.phone,
+        email=clean_email,
+        role=payload.role,
+        password_hash=hash_password(payload.password),
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+@router.post('/login', response_model=TokenPairResponse)
+def login(payload: LoginRequest, response: Response, db: Session = Depends(get_db)):
+    clean_email = str(payload.email).strip().lower()
+    user = db.scalar(select(Inspector).where(Inspector.email == clean_email))
+    if not user or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Неверный email или пароль')
+
+    access_token = create_access_token(str(user.id))
+    refresh_token = create_refresh_token()
+    db.add(RefreshToken(inspector_id=user.id, token_hash=hash_refresh_token(refresh_token), expires_at=refresh_token_expiry()))
+    db.commit()
+    response.set_cookie(key='refresh_token', value=refresh_token, httponly=True, secure=True, samesite='lax')
+    return TokenPairResponse(access_token=access_token)
+
+
+==================== BACKEND SECURITY (backend/app/security.py) ====================
+from datetime import UTC, datetime, timedelta
+import hashlib
+import bcrypt
+from jose import JWTError, jwt
+from .config import settings
+
+def hash_password(password: str) -> str:
+    pwd_bytes = password.encode('utf-8')[:72]
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(pwd_bytes, salt).decode('utf-8')
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    try:
+        pwd_bytes = plain_password.encode('utf-8')[:72]
+        return bcrypt.checkpw(pwd_bytes, hashed_password.encode('utf-8'))
+    except Exception:
+        return False
+
+def create_access_token(subject: str) -> str:
+    expires_delta = timedelta(minutes=settings.access_token_expire_minutes)
+    payload = {'sub': str(subject), 'exp': datetime.now(UTC) + expires_delta, 'type': 'access'}
+    return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
+
+def decode_access_token(token: str) -> dict:
+    try:
+        return jwt.decode(token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm])
+    except JWTError:
+        return {}
+
+def create_refresh_token() -> str:
+    return hashlib.sha256(f"{datetime.now(UTC).timestamp()}_{settings.jwt_secret_key}".encode()).hexdigest()
+
+def hash_refresh_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+def refresh_token_expiry() -> datetime:
+    return datetime.now(UTC) + timedelta(days=settings.refresh_token_expire_days)
+
+
+==================== AXIOS CONFIG (src/api/axios.ts) ====================
+import axios, { AxiosError, InternalAxiosRequestConfig } from 'axios';
+
+// Изолированное хранилище токена в оперативной памяти
+let inMemoryAccessToken: string | null = null;
+
+let isRefreshing = false;
+let failedQueue: Array<{
+  resolve: (token: string) => void;
+  reject: (error: any) => void;
+}> = [];
+
+const processQueue = (error: any, token: string | null = null) => {
+  failedQueue.forEach((prom) => {
+    if (error) {
+      prom.reject(error);
+    } else if (token) {
+      prom.resolve(token);
+    }
+  });
+  failedQueue = [];
+};
+
+export const setAccessToken = (token: string | null) => {
+  inMemoryAccessToken = token;
+};
+
+export const getAccessToken = (): string | null => {
+  return inMemoryAccessToken;
+};
+
+export interface ApiErrorResponse {
+  message?: string;
+  detail?: string | Array<{ loc: string[]; msg: string; type: string }>;
+  error_code?: string;
+  status_code?: number;
+}
+
+export const getApiErrorMessage = (error: unknown, defaultMessage = 'Произошла непредвиденная ошибка'): string => {
+  if (axios.isAxiosError(error)) {
+    const axiosError = error as AxiosError<ApiErrorResponse>;
+    if (axiosError.response?.data) {
+      const data = axiosError.response.data;
+      if (typeof data.detail === 'string') return data.detail;
+      if (Array.isArray(data.detail) && data.detail.length > 0) return data.detail.map(d => d.msg).join(', ');
+      if (data.message) return data.message;
+    }
+    if (axiosError.message === 'Network Error') {
+      return 'Сетевая ошибка: проверьте подключение к защищенному серверу.';
+    }
+  }
+  return defaultMessage;
+};
+
+const api = axios.create({
+  baseURL: import.meta.env.VITE_API_URL || '/api',
+  timeout: 15000,
+  withCredentials: true,
+  headers: {
+    'Accept': 'application/json',
+    'Content-Type': 'application/json',
+  },
+});
+
+api.interceptors.request.use(
+  (config: InternalAxiosRequestConfig) => {
+    if (inMemoryAccessToken && !config.headers.Authorization) {
+      config.headers.Authorization = `Bearer ${inMemoryAccessToken}`;
+    }
+    return config;
+  },
+  (error) => Promise.reject(error)
+);
+
+api.interceptors.response.use(
+  (response) => response,
+  async (error: AxiosError) => {
+    const originalRequest = error.config as InternalAxiosRequestConfig & { _retry?: boolean };
+
+    if (error.response?.status === 401 && !originalRequest?.url?.includes("/auth/login")) {
+      window.dispatchEvent(new CustomEvent("app_error", { detail: "Сессия истекла. Авторизуйтесь заново." }));
+    } else if (error.response?.status === 403) {
+      window.dispatchEvent(new CustomEvent("app_error", { detail: "Ошибка 403: У вас нет прав для выполнения этого действия" }));
+    } else if (error.response) {
+      const data: any = error.response.data;
+      const msg = data?.detail || `Ошибка сервера: ${error.response.status}`;
+      window.dispatchEvent(new CustomEvent("app_error", { detail: typeof msg === "string" ? msg : "Ошибка сервера" }));
+    } else {
+      window.dispatchEvent(new CustomEvent("app_error", { detail: "Ошибка сети: Сервер недоступен" }));
+    }
+
+    return Promise.reject(error);
+  }
+);
+
+export default api;
+

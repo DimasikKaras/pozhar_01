@@ -1,11 +1,11 @@
 FROM node:20-alpine AS build
 WORKDIR /app
 
-COPY package.json tsconfig.json ./
-RUN npm install
+COPY package*.json ./
+RUN npm install --include=dev --prefer-offline --no-audit --no-fund
 
 COPY . .
-RUN npx vite build
+RUN npm run build
 
 FROM nginx:alpine
 COPY --from=build /app/dist /usr/share/nginx/html
