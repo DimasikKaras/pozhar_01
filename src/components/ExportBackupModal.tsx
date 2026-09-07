@@ -17,7 +17,7 @@ import {
   FileCheck2,
   Users
 } from 'lucide-react';
-import { Facility, Inspection, Equipment, Inspector, AuditLogEntry, BackupPayload } from '../types';
+import { Facility, Inspection, Equipment, Inspector, AuditLogEntry, BackupPayload, isUserAdmin } from '../types';
 import {
   exportFacilitiesToCsv,
   exportInspectionsToCsv,
@@ -27,24 +27,6 @@ import {
 } from '../utils/exportUtils';
 import { createAuditEntry } from '../utils/auditUtils';
 import api from '../api/axios';
-
-// Функция проверки прав администратора
-const isUserAdmin = (user: any): boolean => {
-  if (!user) return false;
-  const role = String(user.role || '').trim().toLowerCase();
-  const email = String(user.email || '').trim().toLowerCase();
-  return (
-    role === 'администратор' ||
-    role === 'admin' ||
-    role === 'administrator' ||
-    role === 'админ' ||
-    email === 'dbykov338@gmail.com' ||
-    email === 'dbykov141@gmail.com' ||
-    email.startsWith('admin') ||
-    user.is_superuser === true ||
-    user.is_admin === true
-  );
-};
 
 interface ExportBackupModalProps {
   isOpen: boolean;

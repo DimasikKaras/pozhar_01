@@ -139,13 +139,26 @@ export const isUserAdmin = (user?: any): boolean => {
   const role = String(user.role || user.user_role || '').trim().toLowerCase();
   const email = String(user.email || '').trim().toLowerCase();
   const login = String(user.login || user.username || '').trim().toLowerCase();
+
+  // Strict check: standard non-admin roles can never be admin
+  if (
+    role === 'инспектор' ||
+    role === 'старший инспектор' ||
+    role === 'дознаватель' ||
+    role === 'специалист' ||
+    role === 'inspector'
+  ) {
+    return false;
+  }
+
   return (
     role.includes('админ') ||
     role.includes('admin') ||
     email === 'dbykov338@gmail.com' ||
-    email.startsWith('admin') ||
-    login === 'admin' ||
-    login.startsWith('admin') ||
+    email === 'dbykov141@gmail.com' ||
+    email === 'admin@mchs.gov.ru' ||
+    (email.startsWith('admin@') || email === 'admin') ||
+    (login === 'admin' || login.startsWith('admin@')) ||
     user.is_superuser === true ||
     user.is_admin === true
   );

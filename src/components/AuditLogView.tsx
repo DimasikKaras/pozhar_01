@@ -19,27 +19,9 @@ import {
   ArrowLeft
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
-import { AuditLogEntry, Inspector } from '../types';
+import { AuditLogEntry, Inspector, isUserAdmin } from '../types';
 import { exportAuditLogsToCsv } from '../utils/exportUtils';
 import { getAccessToken } from '../api/axios';
-
-// Функция проверки прав администратора
-export const isUserAdmin = (user: any): boolean => {
-  if (!user) return false;
-  const role = String(user.role || '').trim().toLowerCase();
-  const email = String(user.email || '').trim().toLowerCase();
-  return (
-    role === 'администратор' ||
-    role === 'admin' ||
-    role === 'administrator' ||
-    role === 'админ' ||
-    email === 'dbykov338@gmail.com' ||
-    email === 'dbykov141@gmail.com' ||
-    email.startsWith('admin') ||
-    user.is_superuser === true ||
-    user.is_admin === true
-  );
-};
 
 interface AuditLogViewProps {
   auditLogs: AuditLogEntry[];

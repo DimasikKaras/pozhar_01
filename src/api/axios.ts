@@ -1,7 +1,13 @@
 import axios, { AxiosError, InternalAxiosRequestConfig } from 'axios';
 
-// Изолированное хранилище токена в оперативной памяти
+// Изолированное хранилище токена в оперативной памяти и localStorage
 let inMemoryAccessToken: string | null = null;
+try {
+  inMemoryAccessToken =
+    localStorage.getItem('token') ||
+    localStorage.getItem('access_token') ||
+    null;
+} catch {}
 
 let isRefreshing = false;
 let failedQueue: Array<{
@@ -22,10 +28,24 @@ const processQueue = (error: any, token: string | null = null) => {
 
 export const setAccessToken = (token: string | null) => {
   inMemoryAccessToken = token;
+  try {
+    if (token) {
+      localStorage.setItem('token', token);
+      localStorage.setItem('access_token', token);
+    } else {
+      localStorage.removeItem('token');
+      localStorage.removeItem('access_token');
+    }
+  } catch {}
 };
 
 export const getAccessToken = (): string | null => {
-  return inMemoryAccessToken;
+  if (inMemoryAccessToken) return inMemoryAccessToken;
+  try {
+    return localStorage.getItem('token') || localStorage.getItem('access_token') || null;
+  } catch {
+    return null;
+  }
 };
 
 export interface ApiErrorResponse {
@@ -63,29 +83,52 @@ const api = axios.create({
 
 api.interceptors.request.use(
   (config: InternalAxiosRequestConfig) => {
-    if (inMemoryAccessToken && !config.headers.Authorization) {
-      config.headers.Authorization = `Bearer ${inMemoryAccessToken}`;
+    const token = getAccessToken();
+    if (token && !config.headers.Authorization) {
+      config.headers.Authorization = `Bearer ${token}`;
     }
     return config;
   },
   (error) => Promise.reject(error)
 );
 
+let last401ToastTime = 0;
+
 api.interceptors.response.use(
   (response) => response,
   async (error: AxiosError) => {
-    const originalRequest = error.config as InternalAxiosRequestConfig & { _retry?: boolean };
+    const originalRequest = error.config as InternalAxiosRequestConfig & { _retry?: boolean; silent?: boolean };
+
+    // Если запрос помечен как фоновый (X-Silent или silent), не выводим уведомления в UI
+    const isSilent =
+      originalRequest?.silent ||
+      Boolean(originalRequest?.headers && (originalRequest.headers as any)['X-Silent']);
+
+    if (isSilent) {
+      return Promise.reject(error);
+    }
 
     if (error.response?.status === 401 && !originalRequest?.url?.includes("/auth/login")) {
-      window.dispatchEvent(new CustomEvent("app_error", { detail: "Сессия истекла. Авторизуйтесь заново." }));
+      const now = Date.now();
+      const hasSavedUser = !!(
+        localStorage.getItem('token') ||
+        localStorage.getItem('current_user') ||
+        localStorage.getItem('app_current_user')
+      );
+      // Ограничиваем частоту показа уведомления "Сессия истекла" (не чаще 1 раза в 15 секунд)
+      if (hasSavedUser && now - last401ToastTime > 15000) {
+        last401ToastTime = now;
+        window.dispatchEvent(new CustomEvent("app_error", { detail: "Сессия истекла. Авторизуйтесь заново." }));
+      }
     } else if (error.response?.status === 403) {
       window.dispatchEvent(new CustomEvent("app_error", { detail: "Ошибка 403: У вас нет прав для выполнения этого действия" }));
     } else if (error.response) {
-      const data: any = error.response.data;
-      const msg = data?.detail || `Ошибка сервера: ${error.response.status}`;
-      window.dispatchEvent(new CustomEvent("app_error", { detail: typeof msg === "string" ? msg : "Ошибка сервера" }));
-    } else {
-      window.dispatchEvent(new CustomEvent("app_error", { detail: "Ошибка сети: Сервер недоступен" }));
+      // Игнорируем сетевой шум 404
+      if (error.response.status !== 404) {
+        const data: any = error.response.data;
+        const msg = data?.detail || `Ошибка сервера: ${error.response.status}`;
+        window.dispatchEvent(new CustomEvent("app_error", { detail: typeof msg === "string" ? msg : "Ошибка сервера" }));
+      }
     }
 
     return Promise.reject(error);

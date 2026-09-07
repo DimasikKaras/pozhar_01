@@ -100,7 +100,8 @@ import {
   RiskLevel,
   EquipmentStatus,
   InspectionResult,
-  Role
+  Role,
+  isUserAdmin
 } from './types';
 import {
   INITIAL_FACILITIES,
@@ -108,25 +109,7 @@ import {
   INITIAL_EQUIPMENT,
   INITIAL_INSPECTIONS
 } from './data/initialData';
-import api, { setAccessToken } from './api/axios';
-
-// Функция проверки прав администратора
-const isUserAdmin = (user: any): boolean => {
-  if (!user) return false;
-  const role = String(user.role || '').trim().toLowerCase();
-  const email = String(user.email || '').trim().toLowerCase();
-  return (
-    role === 'администратор' ||
-    role === 'admin' ||
-    role === 'administrator' ||
-    role === 'админ' ||
-    email === 'dbykov338@gmail.com' ||
-    email === 'dbykov141@gmail.com' ||
-    email.startsWith('admin') ||
-    user.is_superuser === true ||
-    user.is_admin === true
-  );
-};
+import api, { setAccessToken, getAccessToken } from './api/axios';
 
 
 
@@ -286,6 +269,7 @@ function AuthScreen({
   // Failed attempt protection
   const [failedAttempts, setFailedAttempts] = useState<number>(0);
   const [lockoutTimer, setLockoutTimer] = useState<number>(0);
+  const [serverAccessToken, setServerAccessToken] = useState<string | null>(null);
 
   // Registration 2FA Setup Flow State
   const [setup2FAUser, setSetup2FAUser] = useState<Inspector | null>(null);
@@ -480,6 +464,7 @@ function AuthScreen({
           password: password
         });
         if (authRes.data && authRes.data.access_token) {
+          setServerAccessToken(authRes.data.access_token);
           setAccessToken(authRes.data.access_token);
         }
       } catch (authErr: any) {
@@ -588,7 +573,8 @@ function AuthScreen({
 
       if (result.valid) {
         setFailedAttempts(0);
-        setAccessToken('token-totp-verified-' + twoFactorPendingUser.id);
+        const validToken = serverAccessToken || getAccessToken() || ('token-session-' + twoFactorPendingUser.id);
+        setAccessToken(validToken);
         onLogin(twoFactorPendingUser);
         return;
       } else {
@@ -611,7 +597,8 @@ function AuthScreen({
 
       if (verifyRes.valid) {
         setFailedAttempts(0);
-        setAccessToken('token-email-verified-' + twoFactorPendingUser.id);
+        const validToken = serverAccessToken || getAccessToken() || ('token-session-' + twoFactorPendingUser.id);
+        setAccessToken(validToken);
         onLogin(twoFactorPendingUser);
         return;
       } else {
@@ -643,7 +630,8 @@ function AuthScreen({
         };
 
         setFailedAttempts(0);
-        setAccessToken('token-backup-verified-' + twoFactorPendingUser.id);
+        const validToken = serverAccessToken || getAccessToken() || ('token-session-' + twoFactorPendingUser.id);
+        setAccessToken(validToken);
         onLogin(updatedUser);
         return;
       } else {
@@ -685,6 +673,7 @@ function AuthScreen({
 
     // Registration confirmed with real 2FA!
     let createdUser: Inspector = setup2FAUser;
+    let acquiredToken: string | null = null;
     try {
       const regRes = await api.post('/auth/register', {
         full_name: setup2FAUser.full_name,
@@ -718,7 +707,18 @@ function AuthScreen({
       } catch {}
     }
 
-    setAccessToken('token-registered-2fa-' + createdUser.id);
+    try {
+      const loginRes = await api.post('/auth/login', {
+        email: setup2FAUser.email,
+        password: password
+      });
+      if (loginRes.data?.access_token) {
+        acquiredToken = loginRes.data.access_token;
+      }
+    } catch {}
+
+    const finalRegToken = acquiredToken || ('token-session-' + createdUser.id);
+    setAccessToken(finalRegToken);
     onLogin(createdUser);
   };
 
@@ -4147,7 +4147,7 @@ export default function App() {
       if (isUserAdmin(activeUser)) return;
 
       try {
-        const res = await api.get('/inspectors');
+        const res = await api.get('/inspectors', { headers: { 'X-Silent': 'true' } });
         if (Array.isArray(res.data) && res.data.length > 0) {
           const list = sanitizeLegacyIds(res.data);
           setInspectors(list);
@@ -4180,10 +4180,10 @@ export default function App() {
     const loadBackendData = async () => {
       try {
         const [fRes, iRes, eqRes, inspRes] = await Promise.allSettled([
-          api.get('/facilities'),
-          api.get('/inspectors'),
-          api.get('/equipment'),
-          api.get('/inspections')
+          api.get('/facilities', { headers: { 'X-Silent': 'true' } }),
+          api.get('/inspectors', { headers: { 'X-Silent': 'true' } }),
+          api.get('/equipment', { headers: { 'X-Silent': 'true' } }),
+          api.get('/inspections', { headers: { 'X-Silent': 'true' } })
         ]);
 
         if (fRes.status === 'fulfilled' && Array.isArray(fRes.value.data)) {
@@ -4211,8 +4211,8 @@ export default function App() {
     };
 
     loadBackendData();
-    const pollInterval = setInterval(checkActiveUser, 2000);
-    const syncInterval = setInterval(loadBackendData, 3000);
+    const pollInterval = setInterval(checkActiveUser, 10000);
+    const syncInterval = setInterval(loadBackendData, 15000);
 
     return () => {
       clearInterval(pollInterval);
@@ -4707,33 +4707,35 @@ export default function App() {
 
         <MobileBottomNav />
       </main>
-      <ExportBackupModal
-        isOpen={isExportModalOpen}
-        onClose={() => setIsExportModalOpen(false)}
-        facilities={facilities}
-        inspections={inspections}
-        equipment={equipment}
-        inspectors={inspectors}
-        auditLogs={auditLogs}
-        currentUser={currentUser}
-        onAuditCreated={(entry) => setAuditLogs((prev) => [entry, ...prev])}
-        showToast={showToast}
-        onRestoreDatabase={(restoredData) => {
-          setFacilities(restoredData.facilities);
-          setInspections(restoredData.inspections);
-          setEquipment(restoredData.equipment);
-          setInspectors(restoredData.inspectors);
-          setAuditLogs(restoredData.auditLogs);
+      {isExportModalOpen && isUserAdmin(currentUser) && (
+        <ExportBackupModal
+          isOpen={isExportModalOpen}
+          onClose={() => setIsExportModalOpen(false)}
+          facilities={facilities}
+          inspections={inspections}
+          equipment={equipment}
+          inspectors={inspectors}
+          auditLogs={auditLogs}
+          currentUser={currentUser}
+          onAuditCreated={(entry) => setAuditLogs((prev) => [entry, ...prev])}
+          showToast={showToast}
+          onRestoreDatabase={(restoredData) => {
+            setFacilities(restoredData.facilities);
+            setInspections(restoredData.inspections);
+            setEquipment(restoredData.equipment);
+            setInspectors(restoredData.inspectors);
+            setAuditLogs(restoredData.auditLogs);
 
-          localStorage.setItem('app_facilities', JSON.stringify(restoredData.facilities));
-          localStorage.setItem('app_inspections', JSON.stringify(restoredData.inspections));
-          localStorage.setItem('app_equipment', JSON.stringify(restoredData.equipment));
-          localStorage.setItem('app_inspectors', JSON.stringify(restoredData.inspectors));
-          localStorage.setItem('inspectors_registry', JSON.stringify(restoredData.inspectors));
-          saveAuditLogs(restoredData.auditLogs);
-          showToast(`База данных успешно восстановлена (${restoredData.facilities.length} объектов, ${restoredData.inspections.length} проверок)`);
-        }}
-      />
+            localStorage.setItem('app_facilities', JSON.stringify(restoredData.facilities));
+            localStorage.setItem('app_inspections', JSON.stringify(restoredData.inspections));
+            localStorage.setItem('app_equipment', JSON.stringify(restoredData.equipment));
+            localStorage.setItem('app_inspectors', JSON.stringify(restoredData.inspectors));
+            localStorage.setItem('inspectors_registry', JSON.stringify(restoredData.inspectors));
+            saveAuditLogs(restoredData.auditLogs);
+            showToast(`База данных успешно восстановлена (${restoredData.facilities.length} объектов, ${restoredData.inspections.length} проверок)`);
+          }}
+        />
+      )}
     </div>
   );
 }
