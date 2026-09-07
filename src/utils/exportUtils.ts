@@ -117,23 +117,78 @@ export const exportAuditLogsToCsv = (auditLogs: AuditLogEntry[]) => {
 };
 
 export const exportFullDatabaseBackup = (
-  facilities: Facility[],
-  inspections: Inspection[],
-  equipment: Equipment[],
-  inspectors: Inspector[],
-  auditLogs: AuditLogEntry[]
+  facilitiesOrObj: any,
+  maybeInspections?: Inspection[],
+  maybeEquipment?: Equipment[],
+  maybeInspectors?: Inspector[],
+  maybeAuditLogs?: AuditLogEntry[]
 ) => {
+  let facilities: Facility[] = [];
+  let inspections: Inspection[] = [];
+  let equipment: Equipment[] = [];
+  let inspectors: Inspector[] = [];
+  let auditLogs: AuditLogEntry[] = [];
+
+  if (facilitiesOrObj && !Array.isArray(facilitiesOrObj) && typeof facilitiesOrObj === 'object') {
+    facilities = Array.isArray(facilitiesOrObj.facilities) ? facilitiesOrObj.facilities : [];
+    inspections = Array.isArray(facilitiesOrObj.inspections) ? facilitiesOrObj.inspections : [];
+    equipment = Array.isArray(facilitiesOrObj.equipment) ? facilitiesOrObj.equipment : [];
+    inspectors = Array.isArray(facilitiesOrObj.inspectors) ? facilitiesOrObj.inspectors : [];
+    auditLogs = Array.isArray(facilitiesOrObj.auditLogs)
+      ? facilitiesOrObj.auditLogs
+      : Array.isArray(facilitiesOrObj.audit_logs)
+      ? facilitiesOrObj.audit_logs
+      : [];
+  } else {
+    facilities = Array.isArray(facilitiesOrObj) ? facilitiesOrObj : [];
+    inspections = Array.isArray(maybeInspections) ? maybeInspections : [];
+    equipment = Array.isArray(maybeEquipment) ? maybeEquipment : [];
+    inspectors = Array.isArray(maybeInspectors) ? maybeInspectors : [];
+    auditLogs = Array.isArray(maybeAuditLogs) ? maybeAuditLogs : [];
+  }
+
+  if (facilities.length === 0) {
+    try {
+      const saved = localStorage.getItem('app_facilities');
+      if (saved) facilities = JSON.parse(saved);
+    } catch {}
+  }
+  if (inspections.length === 0) {
+    try {
+      const saved = localStorage.getItem('app_inspections');
+      if (saved) inspections = JSON.parse(saved);
+    } catch {}
+  }
+  if (equipment.length === 0) {
+    try {
+      const saved = localStorage.getItem('app_equipment');
+      if (saved) equipment = JSON.parse(saved);
+    } catch {}
+  }
+  if (inspectors.length === 0) {
+    try {
+      const saved = localStorage.getItem('app_inspectors') || localStorage.getItem('inspectors_registry');
+      if (saved) inspectors = JSON.parse(saved);
+    } catch {}
+  }
+  if (auditLogs.length === 0) {
+    try {
+      const saved = localStorage.getItem('audit_logs_v1');
+      if (saved) auditLogs = JSON.parse(saved);
+    } catch {}
+  }
+
   let storedUsers: any[] = [];
   try {
     const raw = localStorage.getItem('app_users_credentials') || localStorage.getItem('inspectors_registry') || '[]';
     storedUsers = JSON.parse(raw);
   } catch {}
 
-  const fullUsers = inspectors.map(insp => {
+  const fullUsers = (inspectors || []).map(insp => {
     const match = storedUsers.find((u: any) => u.id === insp.id || u.email === insp.email);
     return {
       ...insp,
-      login: insp.login || (match && match.login) || insp.email.split('@')[0],
+      login: insp.login || (match && match.login) || (insp.email ? insp.email.split('@')[0] : 'user'),
       password_hash: (match && match.password_hash) || insp.password_hash || undefined,
       password: (match && match.password) || insp.password || undefined,
       two_factor_secret: insp.two_factor_secret || (match && match.two_factor_secret) || undefined,
@@ -157,17 +212,6 @@ export const exportFullDatabaseBackup = (
     }
   };
 
-  const jsonStr = JSON.stringify(payload, null, 2);
-  const blob = new Blob([jsonStr], { type: 'application/json;charset=utf-8;' });
-  try {
-    saveAs(blob, filename);
-  } catch {
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    setTimeout(() => { if (link.parentNode) link.parentNode.removeChild(link); URL.revokeObjectURL(url); }, 2000);
-  }
+  const filename = `Резервная_копия_ПожНадзор_${new Date().toISOString().slice(0, 10)}.json`;
+  downloadJsonFile(payload, filename);
 };

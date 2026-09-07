@@ -4550,6 +4550,7 @@ export default function App() {
                 {location.pathname.startsWith('/inspections') && 'Журнал проверок ГПН'}
                 {location.pathname.startsWith('/inspectors') && 'Инспекторский состав ГПН'}
                 {location.pathname.startsWith('/equipment') && 'Реестр оборудования и СИЗ'}
+                {location.pathname.startsWith('/audit') && 'Журнал аудита действий'}
                 {location.pathname.startsWith('/profile') && 'Служебный профиль'}
               </h1>
               <p className="text-[10px] text-slate-400 font-semibold lg:hidden truncate">
@@ -4674,6 +4675,24 @@ export default function App() {
                 }
               />
               <Route
+                path="/audit"
+                element={
+                  <AuditLogView
+                    auditLogs={auditLogs}
+                    currentUser={currentUser}
+                    onClearLogs={() => {
+                      setAuditLogs([]);
+                      saveAuditLogs([]);
+                      showToast('Журнал аудита очищен');
+                    }}
+                    onRefresh={() => {
+                      setAuditLogs(loadAuditLogs());
+                      showToast('Журнал аудита обновлен');
+                    }}
+                  />
+                }
+              />
+              <Route
                 path="/profile"
                 element={
                   <ProfileView
@@ -4695,7 +4714,33 @@ export default function App() {
 
         <MobileBottomNav />
       </main>
-      <ExportBackupModal isOpen={isExportModalOpen} onClose={() => setIsExportModalOpen(false)} facilities={facilities} inspections={inspections} equipment={equipment} inspectors={inspectors} auditLogs={auditLogs} currentUser={currentUser} onAuditCreated={(entry) => setAuditLogs((prev) => [entry, ...prev])} showToast={showToast} />
+      <ExportBackupModal
+        isOpen={isExportModalOpen}
+        onClose={() => setIsExportModalOpen(false)}
+        facilities={facilities}
+        inspections={inspections}
+        equipment={equipment}
+        inspectors={inspectors}
+        auditLogs={auditLogs}
+        currentUser={currentUser}
+        onAuditCreated={(entry) => setAuditLogs((prev) => [entry, ...prev])}
+        showToast={showToast}
+        onRestoreDatabase={(restoredData) => {
+          setFacilities(restoredData.facilities);
+          setInspections(restoredData.inspections);
+          setEquipment(restoredData.equipment);
+          setInspectors(restoredData.inspectors);
+          setAuditLogs(restoredData.auditLogs);
+
+          localStorage.setItem('app_facilities', JSON.stringify(restoredData.facilities));
+          localStorage.setItem('app_inspections', JSON.stringify(restoredData.inspections));
+          localStorage.setItem('app_equipment', JSON.stringify(restoredData.equipment));
+          localStorage.setItem('app_inspectors', JSON.stringify(restoredData.inspectors));
+          localStorage.setItem('inspectors_registry', JSON.stringify(restoredData.inspectors));
+          saveAuditLogs(restoredData.auditLogs);
+          showToast(`База данных успешно восстановлена (${restoredData.facilities.length} объектов, ${restoredData.inspections.length} проверок)`);
+        }}
+      />
     </div>
   );
 }
