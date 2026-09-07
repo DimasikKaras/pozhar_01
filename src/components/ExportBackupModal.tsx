@@ -26,6 +26,7 @@ import {
   exportFullDatabaseBackup
 } from '../utils/exportUtils';
 import { createAuditEntry } from '../utils/auditUtils';
+import api from '../api/axios';
 
 // Функция проверки прав администратора
 const isUserAdmin = (user: any): boolean => {
@@ -98,6 +99,29 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
   const isAdmin = isUserAdmin(currentUser);
 
   if (!isOpen) return null;
+
+  if (!isAdmin) {
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/70 backdrop-blur-xs animate-fadeIn">
+        <div className="bg-white w-full max-w-md rounded-3xl shadow-2xl border border-slate-200 overflow-hidden p-6 text-center space-y-4">
+          <div className="w-16 h-16 bg-red-50 text-red-600 rounded-2xl flex items-center justify-center mx-auto border border-red-100">
+            <ShieldAlert className="w-8 h-8" />
+          </div>
+          <h3 className="text-xl font-bold text-slate-900">Доступ ограничен</h3>
+          <p className="text-xs text-slate-600 leading-relaxed">
+            Функции создания резервных копий и восстановления базы данных доступны исключительно Администраторам системы.
+          </p>
+          <button
+            type="button"
+            onClick={onClose}
+            className="w-full py-2.5 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold transition-all cursor-pointer"
+          >
+            Закрыть
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   const handleExport = (type: 'facilities' | 'inspections' | 'equipment' | 'audit' | 'all') => {
     let entry: AuditLogEntry | undefined;
@@ -275,6 +299,31 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
       if (onAuditCreated) {
         onAuditCreated(restoreLog);
       }
+
+      // Сохраняем учетные записи и хэши паролей локально, чтобы не требовалось заново регистрировать аккаунты
+      try {
+        const usersToSave = finalInspectors.map((u: any) => ({
+          id: u.id,
+          email: u.email,
+          login: u.login || (u.email ? u.email.split('@')[0] : 'user'),
+          password_hash: u.password_hash || u.hashed_password || '$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW',
+          two_factor_secret: u.two_factor_secret,
+          backup_codes: u.backup_codes
+        }));
+        localStorage.setItem('app_users_credentials', JSON.stringify(usersToSave));
+      } catch {}
+
+      // Отправляем восстановление на бэкенд API (если бэкенд сервер активен)
+      try {
+        api.post('/database/restore', {
+          facilities: finalFacilities,
+          inspections: finalInspections,
+          equipment: finalEquipment,
+          inspectors: finalInspectors,
+          users: finalInspectors,
+          audit_logs: finalAuditLogs
+        }).catch(() => {});
+      } catch {}
 
       showToast?.('База данных успешно восстановлена из резервной копии!');
       onClose();

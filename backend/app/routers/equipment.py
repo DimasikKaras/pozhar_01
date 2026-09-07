@@ -3,7 +3,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from datetime import date, datetime
 from ..database import get_db
-from ..models import Equipment, Facility, EquipmentStatusEnum, RiskLevelEnum
+from ..deps import get_current_user
+from ..models import Equipment, Facility, Inspector, EquipmentStatusEnum, RiskLevelEnum
 from ..schemas import EquipmentCreate, EquipmentOut, EquipmentUpdate
 
 router = APIRouter(prefix="/equipment", tags=["equipment"])
@@ -35,13 +36,20 @@ def serialize_equipment(item: Equipment) -> dict:
 
 @router.get("")
 @router.get("/")
-def list_equipment(db: Session = Depends(get_db)):
+def list_equipment(
+    db: Session = Depends(get_db),
+    current_user: Inspector = Depends(get_current_user)
+):
     items = list(db.scalars(select(Equipment).order_by(Equipment.id.desc())))
     return [serialize_equipment(i) for i in items]
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 @router.post("/", status_code=status.HTTP_201_CREATED)
-def create_equipment(payload: EquipmentCreate, db: Session = Depends(get_db)):
+def create_equipment(
+    payload: EquipmentCreate,
+    db: Session = Depends(get_db),
+    current_user: Inspector = Depends(get_current_user)
+):
     # 1. Привязываем существующий объект
     fac_id = payload.facility_id
     facility = db.get(Facility, fac_id) if fac_id else None
