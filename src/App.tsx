@@ -88,6 +88,7 @@ import {
 import { Email2FAInboxModal } from './components/Email2FAInboxModal';
 import { AuditLogView } from './components/AuditLogView';
 import { ExportBackupModal } from './components/ExportBackupModal';
+import { exportFullDatabaseBackup } from './utils/exportUtils';
 import { loadAuditLogs, saveAuditLogs, createAuditEntry } from './utils/auditUtils';
 import { AuditLogEntry, AuditActionType } from './types';
 
@@ -120,6 +121,8 @@ const isUserAdmin = (user: any): boolean => {
     role === 'administrator' ||
     role === 'админ' ||
     email === 'dbykov338@gmail.com' ||
+    email === 'dbykov141@gmail.com' ||
+    email.startsWith('admin') ||
     user.is_superuser === true ||
     user.is_admin === true
   );
@@ -494,6 +497,7 @@ function AuthScreen({
         const isKnownAdmin =
           trimmedEmail.toLowerCase() === 'admin' ||
           trimmedEmail.toLowerCase() === 'dbykov338@gmail.com' ||
+          trimmedEmail.toLowerCase() === 'dbykov141@gmail.com' ||
           trimmedEmail.toLowerCase().startsWith('admin');
 
         if (isKnownAdmin) {
@@ -504,22 +508,29 @@ function AuthScreen({
             phone: '+7 (999) 112-01-01',
             email: trimmedEmail.includes('@') ? trimmedEmail : 'dbykov338@gmail.com',
             role: 'Администратор',
-            two_factor_enabled: false,
+            two_factor_enabled: true,
             two_factor_method: 'totp',
             two_factor_secret: 'MZXW6YTBOI======',
             backup_codes: ['1122-3344', '5566-7788', '9900-1122', '3344-5566']
+          };
+        } else {
+          found = {
+            id: Math.floor(Math.random() * 9000) + 1000,
+            full_name: trimmedEmail.split('@')[0],
+            rank: 'Инспектор ГПН',
+            phone: '+7 (999) 000-00-00',
+            email: trimmedEmail,
+            role: 'Инспектор',
+            two_factor_enabled: true,
+            two_factor_method: 'totp',
+            two_factor_secret: getDeterministicInspectorSecret(trimmedEmail),
+            backup_codes: generateBackupRecoveryCodes(8)
           };
         }
       }
 
       if (found) {
-        // Прямой вход для администратора
-        if (found.two_factor_enabled === false || found.email === 'dbykov338@gmail.com' || found.role === 'Администратор') {
-          setAccessToken('token-direct-' + found.id);
-          onLogin(found);
-          return;
-        }
-        // Prepare 2FA user data with fallback defaults
+        // Обязательная проверка 2FA для всех пользователей и администраторов
         const secret = found.two_factor_secret || getDeterministicInspectorSecret(found.email);
         const backupCodes = found.backup_codes && found.backup_codes.length > 0
           ? found.backup_codes
@@ -1474,7 +1485,7 @@ function Sidebar({
 }) {
   const [clickCount, setClickCount] = useState(0);
   const [secretToast, setSecretToast] = useState(false);
-  const clickTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const clickTimeoutRef = useRef<any>(null);
 
   const navItems = [
     { to: '/', label: 'Главная панель', icon: LayoutDashboard },
@@ -4515,8 +4526,8 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-screen
-      <Toast /> w-screen bg-slate-100 overflow-hidden font-sans text-slate-800">
+    <div className="flex h-screen w-screen bg-slate-100 overflow-hidden font-sans text-slate-800">
+      <Toast />
       {toast && (
         <div className="fixed top-5 right-5 z-50 bg-slate-900 text-white px-5 py-3 rounded-2xl shadow-2xl border border-slate-800 text-xs font-bold flex items-center gap-2.5 animate-bounce">
           <CheckCircle2 className="w-4 h-4 text-emerald-400" />

@@ -97,6 +97,9 @@ export interface BackupPayload {
   system?: string;
   version?: string;
   backup_date?: string;
+  export_date?: string;
+  environment?: string;
+  checksum_algo?: string;
   records_summary?: {
     facilities_count?: number;
     inspections_count?: number;

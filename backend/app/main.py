@@ -7,7 +7,7 @@ from sqlalchemy import select
 from .config import settings
 from .database import Base, SessionLocal, engine
 from .models import Inspector, Facility, Equipment, Inspection, RoleEnum, RiskLevelEnum, EquipmentStatusEnum, InspectionResultEnum
-from .routers import auth, equipment, facilities, inspections, inspectors, users
+from .routers import auth, database, equipment, facilities, inspections, inspectors, users
 from .security import hash_password
 
 # --- Конфигурация логирования сервера ---
@@ -44,24 +44,41 @@ for prefix in ["/api", ""]:
     app.include_router(facilities.router, prefix=prefix)
     app.include_router(equipment.router, prefix=prefix)
     app.include_router(inspections.router, prefix=prefix)
+    app.include_router(database.router, prefix=prefix)
 
 def seed_initial_data():
     db = SessionLocal()
     try:
-        has_any_user = db.scalar(select(Inspector))
-        if not has_any_user:
-            admin = Inspector(
-                full_name="Быков Дмитрий Алексеевич",
-                rank="Майор внутренней службы",
-                phone="+7 (950) 063-45-97",
-                email="dbykov141@gmail.com",
-                password_hash=hash_password("AdminPass2026!"),
-                role=RoleEnum.admin
-            )
-            db.add(admin)
-            db.commit()
-            db.refresh(admin)
-            logger.info(">>> Создан первичный администратор")
+        # Проверяем и создаем администраторов при необходимости
+        admin_emails = [
+            {
+                "full_name": "Быков Дмитрий Алексеевич",
+                "rank": "Майор внутренней службы",
+                "phone": "+7 (950) 063-45-97",
+                "email": "dbykov141@gmail.com",
+            },
+            {
+                "full_name": "Быков Дмитрий Алексеевич",
+                "rank": "Полковник внутренней службы",
+                "phone": "+7 (999) 112-01-01",
+                "email": "dbykov338@gmail.com",
+            }
+        ]
+        for admin_info in admin_emails:
+            existing = db.scalar(select(Inspector).where(Inspector.email == admin_info["email"]))
+            if not existing:
+                admin = Inspector(
+                    full_name=admin_info["full_name"],
+                    rank=admin_info["rank"],
+                    phone=admin_info["phone"],
+                    email=admin_info["email"],
+                    password_hash=hash_password("AdminPass2026!"),
+                    role=RoleEnum.admin
+                )
+                db.add(admin)
+                db.commit()
+                db.refresh(admin)
+                logger.info(f">>> Создан первичный администратор {admin_info['email']}")
     except Exception as e:
         logger.error(f"Ошибка сидирования: {e}")
         db.rollback()

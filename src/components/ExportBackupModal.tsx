@@ -38,12 +38,12 @@ const isUserAdmin = (user: any): boolean => {
     role === 'administrator' ||
     role === 'админ' ||
     email === 'dbykov338@gmail.com' ||
+    email === 'dbykov141@gmail.com' ||
+    email.startsWith('admin') ||
     user.is_superuser === true ||
     user.is_admin === true
   );
 };
-
-
 
 interface ExportBackupModalProps {
   isOpen: boolean;
@@ -95,7 +95,7 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
   const [isRestoring, setIsRestoring] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const isAdmin = currentUser?.role === 'Администратор';
+  const isAdmin = isUserAdmin(currentUser);
 
   if (!isOpen) return null;
 

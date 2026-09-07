@@ -145,6 +145,12 @@ export async function generateQrCodeDataUrl(otpAuthUrl: string): Promise<string>
   return `https://api.qrserver.com/v1/create-qr-code/?size=280x280&data=${encoded}&margin=2`;
 }
 
+export function generateQrCodeSvg(otpAuthUrl: string): string {
+  if (!otpAuthUrl) return '';
+  const encoded = encodeURIComponent(otpAuthUrl);
+  return `https://api.qrserver.com/v1/create-qr-code/?size=280x280&data=${encoded}&margin=2&format=svg`;
+}
+
 export function generateBackupRecoveryCodes(count = 8): string[] {
   const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
   const codes: string[] = [];

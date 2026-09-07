@@ -1,0 +1,6 @@
+{
+  "name": "ПожНадзор.pro",
+  "description": "Информационная система государственного пожарного надзора (ГПН МЧС России) с двухфакторной аутентификацией, аудитом и резервным копированием",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -23,7 +23,7 @@ import { exportAuditLogsToCsv } from '../utils/exportUtils';
 import api, { getAccessToken } from '../api/axios';
 
 // Функция проверки прав администратора
-const isUserAdmin = (user: any): boolean => {
+export const isUserAdmin = (user: any): boolean => {
   if (!user) return false;
   const role = String(user.role || '').trim().toLowerCase();
   const email = String(user.email || '').trim().toLowerCase();
@@ -33,12 +33,12 @@ const isUserAdmin = (user: any): boolean => {
     role === 'administrator' ||
     role === 'админ' ||
     email === 'dbykov338@gmail.com' ||
+    email === 'dbykov141@gmail.com' ||
+    email.startsWith('admin') ||
     user.is_superuser === true ||
     user.is_admin === true
   );
 };
-
-
 
 interface AuditLogViewProps {
   auditLogs: AuditLogEntry[];
@@ -71,53 +71,7 @@ export const AuditLogView: React.FC<AuditLogViewProps> = ({
   } | null>(null);
 
   const safeLogs = Array.isArray(auditLogs) ? auditLogs : [];
-  const isAdmin = isUserAdmin(currentUser) || isUserAdmin();
-
-  if (!isAdmin) {
-    return (
-      <div className="min-h-[60vh] flex items-center justify-center p-4">
-        <div className="bg-white max-w-md w-full rounded-3xl p-8 border border-slate-200/80 shadow-xl text-center space-y-5">
-          <div className="w-16 h-16 bg-rose-50 text-rose-600 rounded-2xl flex items-center justify-center mx-auto border border-rose-100 ring-8 ring-rose-50/50">
-            <Lock className="w-8 h-8 stroke-[2.2]" />
-          </div>
-
-          <div className="space-y-1.5">
-            <span className="px-2.5 py-0.5 bg-rose-100 text-rose-800 text-[10px] font-extrabold uppercase tracking-wider rounded-md">
-              Отказ в доступе • 403 Forbidden
-            </span>
-            <h2 className="text-xl font-black text-slate-900 tracking-tight">
-              Раздел доступен только Администратору
-            </h2>
-            <p className="text-xs text-slate-500 leading-relaxed pt-1">
-              Просмотр юридически значимого журнала аудита безопасности и управление резервными копиями базы данных
-              разрешены исключительно пользователям с ролью{' '}
-              <strong className="text-slate-800 font-bold">«Администратор»</strong> (согласно ГОСТ Р 57580.1).
-            </p>
-          </div>
-
-          <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-left text-xs space-y-1 text-slate-600">
-            <p className="font-bold text-slate-800">Текущий пользователь:</p>
-            <p>
-              ФИО: <span className="font-semibold text-slate-900">{currentUser?.full_name || 'Не авторизован'}</span>
-            </p>
-            <p>
-              Роль в системе:{' '}
-              <span className="font-semibold text-rose-600">{currentUser?.role || 'Гость'}</span>
-            </p>
-          </div>
-
-          <button
-            type="button"
-            onClick={() => navigate('/')}
-            className="w-full py-2.5 px-4 bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs rounded-xl transition-all flex items-center justify-center gap-2 cursor-pointer shadow-md"
-          >
-            <ArrowLeft className="w-4 h-4" />
-            <span>Вернуться на Главную панель</span>
-          </button>
-        </div>
-      </div>
-    );
-  }
+  const isAdmin = isUserAdmin(currentUser);
 
   const filteredLogs = useMemo(() => {
     const term = searchTerm.toLowerCase().trim();
@@ -269,12 +223,16 @@ export const AuditLogView: React.FC<AuditLogViewProps> = ({
     <div className="space-y-6 animate-fadeIn">
       <div className="bg-white p-6 rounded-3xl border border-slate-200/80 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
-          <div className="flex items-center gap-2 mb-1">
+          <div className="flex items-center gap-2 mb-1 flex-wrap">
             <span className="px-2 py-0.5 bg-red-100 text-red-700 text-[10px] font-extrabold uppercase tracking-wider rounded-md">
               Безопасность и аудит
             </span>
             <span className="text-xs text-slate-400 font-bold">•</span>
             <span className="text-xs text-slate-500 font-medium">ГОСТ Р 57580.1 / ISO 27001</span>
+            <span className="text-xs text-slate-400 font-bold">•</span>
+            <span className={`text-[10px] font-bold px-2 py-0.5 rounded-md ${isAdmin ? 'bg-emerald-100 text-emerald-800 border border-emerald-200' : 'bg-blue-100 text-blue-800 border border-blue-200'}`}>
+              {isAdmin ? 'Администратор • Полный доступ' : 'Инспектор ГПН • Режим аудитора'}
+            </span>
           </div>
           <h2 className="text-xl font-black text-slate-900 tracking-tight flex items-center gap-2">
             <ShieldAlert className="w-6 h-6 text-red-600" />

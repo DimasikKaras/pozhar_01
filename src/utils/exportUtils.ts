@@ -1,16 +1,40 @@
 import { saveAs } from 'file-saver';
-import { Facility, Inspection, Equipment, Inspector, AuditLogEntry } from '../types';
+import { Facility, Inspection, Equipment, Inspector, AuditLogEntry, BackupPayload } from '../types';
+
+export const downloadBlob = (blob: Blob, filename: string) => {
+  try {
+    if (typeof window !== 'undefined' && window.URL && window.URL.createObjectURL) {
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', filename);
+      link.style.display = 'none';
+      document.body.appendChild(link);
+      link.click();
+      setTimeout(() => {
+        try {
+          document.body.removeChild(link);
+          window.URL.revokeObjectURL(url);
+        } catch {}
+      }, 500);
+      return;
+    }
+  } catch (err) {
+    console.warn('Native download failed, falling back to saveAs:', err);
+  }
+  saveAs(blob, filename);
+};
 
 export const downloadCsvFile = (content: string, filename: string) => {
   const bom = '\uFEFF';
   const blob = new Blob([bom + content], { type: 'text/csv;charset=utf-8;' });
-  saveAs(blob, filename);
+  downloadBlob(blob, filename);
 };
 
 export const downloadJsonFile = (data: unknown, filename: string) => {
   const jsonStr = JSON.stringify(data, null, 2);
   const blob = new Blob([jsonStr], { type: 'application/json;charset=utf-8;' });
-  saveAs(blob, filename);
+  downloadBlob(blob, filename);
 };
 
 export const exportFacilitiesToCsv = (facilities: Facility[]) => {
