@@ -125,6 +125,9 @@ def update_inspector(inspector_id: int, payload: InspectorUpdate, db: Session = 
     if payload.password:
         item.password_hash = hash_password(payload.password)
 
+    # Invalidate active refresh tokens for this inspector so active sessions must re-authenticate
+    db.execute(delete(RefreshToken).where(RefreshToken.inspector_id == inspector_id))
+
     db.commit()
     db.refresh(item)
     return item

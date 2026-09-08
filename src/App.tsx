@@ -88,6 +88,7 @@ import {
 import { Email2FAInboxModal } from './components/Email2FAInboxModal';
 import { AuditLogView } from './components/AuditLogView';
 import { ExportBackupModal } from './components/ExportBackupModal';
+import { SessionUpdatedModal } from './components/SessionUpdatedModal';
 import { exportFullDatabaseBackup } from './utils/exportUtils';
 import { loadAuditLogs, saveAuditLogs, createAuditEntry } from './utils/auditUtils';
 import { AuditLogEntry, AuditActionType } from './types';
@@ -4292,6 +4293,27 @@ export default function App() {
 
   // Application State with local persistent fallback (starts on AuthScreen by default if no stored session)
   const [kickedNotice, setKickedNotice] = useState<{ open: boolean; name: string }>({ open: false, name: '' });
+  const [sessionUpdateNotice, setSessionUpdateNotice] = useState<{ open: boolean; name: string }>({ open: false, name: '' });
+
+  const clearUserSession = () => {
+    localStorage.removeItem('current_user');
+    localStorage.removeItem('token');
+    localStorage.removeItem('access_token');
+    localStorage.removeItem('app_current_user');
+    localStorage.removeItem('token_type');
+    localStorage.removeItem('user');
+    setCurrentUser(null);
+    setAccessToken(null);
+  };
+
+  const terminateSessionWithNotice = (userName: string) => {
+    clearUserSession();
+    setSessionUpdateNotice({
+      open: true,
+      name: userName || 'Сотрудник'
+    });
+    navigate('/login');
+  };
   const [currentUser, setCurrentUser] = useState<Inspector | null>(() => {
     const saved = localStorage.getItem('current_user');
     return saved ? JSON.parse(saved) : null;
@@ -4380,14 +4402,67 @@ export default function App() {
     setTimeout(() => setToast(null), 3500);
   };
 
+  // Cross-tab real-time session revocation listener
+  useEffect(() => {
+    const handleRevocation = (inspectorId: number | string, name: string) => {
+      const savedUser = localStorage.getItem('current_user') || localStorage.getItem('app_current_user');
+      const active = currentUser || (savedUser ? JSON.parse(savedUser) : null);
+      if (active && String(active.id) === String(inspectorId)) {
+        terminateSessionWithNotice(name || active.full_name);
+      }
+    };
+
+    let bc: BroadcastChannel | null = null;
+    try {
+      bc = new BroadcastChannel('pozh_session_channel');
+      bc.onmessage = (event) => {
+        if (event.data?.type === 'SESSION_REVOKED_DATA_UPDATED' && event.data?.inspectorId) {
+          handleRevocation(event.data.inspectorId, event.data.full_name);
+        }
+      };
+    } catch {}
+
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === 'pozh_session_revoked' && e.newValue) {
+        try {
+          const data = JSON.parse(e.newValue);
+          if (data?.type === 'SESSION_REVOKED_DATA_UPDATED' && data?.inspectorId) {
+            handleRevocation(data.inspectorId, data.full_name);
+          }
+        } catch {}
+      }
+    };
+    window.addEventListener('storage', onStorage);
+
+    return () => {
+      if (bc) bc.close();
+      window.removeEventListener('storage', onStorage);
+    };
+  }, [currentUser, navigate]);
+
   // Try fetching from backend if running, otherwise keep state
-    // Мониторинг в реальном времени: если текущего пользователя удалили из БД
+  // Мониторинг в реальном времени: если текущего пользователя удалили из БД или обновили его данные
   useEffect(() => {
     const checkActiveUser = async () => {
       const savedUser = localStorage.getItem('current_user') || localStorage.getItem('app_current_user');
       const activeUser = currentUser || (savedUser ? JSON.parse(savedUser) : null);
       if (!activeUser) return;
-      if (isUserAdmin(activeUser)) return;
+
+      // 1. Проверка локальной метки отзыва сессии (при обновлении профиля)
+      try {
+        const revRaw = localStorage.getItem('pozh_session_revoked');
+        if (revRaw) {
+          const rev = JSON.parse(revRaw);
+          if (
+            rev?.type === 'SESSION_REVOKED_DATA_UPDATED' &&
+            String(rev.inspectorId) === String(activeUser.id)
+          ) {
+            localStorage.removeItem('pozh_session_revoked');
+            terminateSessionWithNotice(rev.full_name || activeUser.full_name);
+            return;
+          }
+        }
+      } catch {}
 
       try {
         const res = await api.get('/inspectors', { headers: { 'X-Silent': 'true' } });
@@ -4396,28 +4471,55 @@ export default function App() {
           setInspectors(list);
           localStorage.setItem('app_inspectors', JSON.stringify(list));
 
-          const userExists = list.some(
+          const currentInList = list.find(
             (u: Inspector) =>
               u.id === activeUser.id ||
               String(u.id) === String(activeUser.id) ||
               (u.email && activeUser.email && u.email.trim().toLowerCase() === activeUser.email.trim().toLowerCase())
           );
 
-          if (!userExists) {
+          if (!currentInList) {
             // Пользователя удалил Администратор!
-            const userName = activeUser.full_name || 'Сотрудник';
-            localStorage.removeItem('current_user');
-            localStorage.removeItem('token');
-            localStorage.removeItem('app_current_user');
-            localStorage.removeItem('token_type');
-            localStorage.removeItem('user');
-            setCurrentUser(null);
-            setAccessToken(null);
-            setKickedNotice({ open: true, name: userName });
-            navigate('/login');
+            if (!isUserAdmin(activeUser)) {
+              const userName = activeUser.full_name || 'Сотрудник';
+              clearUserSession();
+              setKickedNotice({ open: true, name: userName });
+              navigate('/login');
+              return;
+            }
+          } else {
+            // Пользователь найден. Проверяем, изменились ли критические данные профиля (ФИО, звание, роль, email)
+            const nameChanged = Boolean(currentInList.full_name && activeUser.full_name && currentInList.full_name.trim() !== activeUser.full_name.trim());
+            const rankChanged = Boolean(currentInList.rank && activeUser.rank && currentInList.rank.trim() !== activeUser.rank.trim());
+            const roleChanged = Boolean(currentInList.role && activeUser.role && currentInList.role !== activeUser.role);
+            const emailChanged = Boolean(currentInList.email && activeUser.email && currentInList.email.trim().toLowerCase() !== activeUser.email.trim().toLowerCase());
+
+            if (nameChanged || rankChanged || roleChanged || emailChanged) {
+              terminateSessionWithNotice(currentInList.full_name || activeUser.full_name);
+              return;
+            }
           }
         }
-      } catch {}
+      } catch {
+        // Резервная проверка по локальному реестру, если бэкенд временно недоступен
+        try {
+          const storedStr = localStorage.getItem('app_inspectors') || localStorage.getItem('inspectors_registry');
+          if (storedStr) {
+            const list: Inspector[] = JSON.parse(storedStr);
+            const currentInList = list.find((u: Inspector) => u.id === activeUser.id || String(u.id) === String(activeUser.id));
+            if (currentInList) {
+              const nameChanged = Boolean(currentInList.full_name && activeUser.full_name && currentInList.full_name.trim() !== activeUser.full_name.trim());
+              const rankChanged = Boolean(currentInList.rank && activeUser.rank && currentInList.rank.trim() !== activeUser.rank.trim());
+              const roleChanged = Boolean(currentInList.role && activeUser.role && currentInList.role !== activeUser.role);
+              const emailChanged = Boolean(currentInList.email && activeUser.email && currentInList.email.trim().toLowerCase() !== activeUser.email.trim().toLowerCase());
+
+              if (nameChanged || rankChanged || roleChanged || emailChanged) {
+                terminateSessionWithNotice(currentInList.full_name || activeUser.full_name);
+              }
+            }
+          }
+        } catch {}
+      }
     };
 
     const loadBackendData = async () => {
@@ -4521,18 +4623,23 @@ export default function App() {
           return updatedList;
         });
 
-        // If the edited inspector is the currently logged-in user, update session
-        if (currentUser && (currentUser.id === inspData.id || String(currentUser.id) === String(inspData.id))) {
-          const updatedUser: Inspector = {
-            ...currentUser,
-            ...merged
-          };
-          setCurrentUser(updatedUser);
-          try {
-            localStorage.setItem('current_user', JSON.stringify(updatedUser));
-            localStorage.setItem('app_current_user', JSON.stringify(updatedUser));
-          } catch {}
-        }
+        // Broadcast session revocation to online sessions of this inspector
+        const revokePayload = {
+          type: 'SESSION_REVOKED_DATA_UPDATED',
+          inspectorId: inspData.id,
+          full_name: merged.full_name,
+          updatedAt: Date.now()
+        };
+
+        try {
+          const bc = new BroadcastChannel('pozh_session_channel');
+          bc.postMessage(revokePayload);
+          bc.close();
+        } catch {}
+
+        try {
+          localStorage.setItem('pozh_session_revoked', JSON.stringify(revokePayload));
+        } catch {}
 
         // Record audit log
         try {
@@ -4540,14 +4647,20 @@ export default function App() {
             currentUser,
             'Изменение сотрудника',
             merged.full_name || `Инспектор #${inspData.id}`,
-            `Изменены данные: звание «${merged.rank}», роль «${merged.role}», email «${merged.email}»`
+            `Изменены данные: звание «${merged.rank}», роль «${merged.role}», email «${merged.email}». Сессия сброшена для повторной авторизации.`
           );
           setAuditLogs((prev) => [entry, ...prev]);
         } catch (auditErr) {
           console.error('Failed to create audit log for inspector edit:', auditErr);
         }
 
-        showToast('Данные инспектора успешно обновлены');
+        // If the edited inspector is the currently logged-in user in this tab, immediately terminate session
+        if (currentUser && (currentUser.id === inspData.id || String(currentUser.id) === String(inspData.id))) {
+          terminateSessionWithNotice(merged.full_name || currentUser.full_name);
+          return;
+        }
+
+        showToast('Данные инспектора обновлены. Активная сессия пользователя завершена для применения изменений.');
       } else {
         const nextId = getNextSequentialId(inspectors);
         const newInsp: Inspector = {
@@ -4847,6 +4960,12 @@ export default function App() {
             </div>
           </div>
         )}
+
+        <SessionUpdatedModal
+          isOpen={sessionUpdateNotice.open}
+          userName={sessionUpdateNotice.name}
+          onConfirm={() => setSessionUpdateNotice({ open: false, name: '' })}
+        />
       </>
     );
   }
@@ -5067,6 +5186,12 @@ export default function App() {
           }}
         />
       )}
+
+      <SessionUpdatedModal
+        isOpen={sessionUpdateNotice.open}
+        userName={sessionUpdateNotice.name}
+        onConfirm={() => setSessionUpdateNotice({ open: false, name: '' })}
+      />
     </div>
   );
 }
