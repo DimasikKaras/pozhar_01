@@ -223,6 +223,105 @@ export const sanitizeLegacyIds = <T extends { id: number }>(items: T[]): T[] => 
   });
 };
 
+// Comprehensive Deduplication Helpers
+export const deduplicateFacilities = (items: Facility[]): { facilities: Facility[]; idMap: Map<number, number> } => {
+  const result: Facility[] = [];
+  const nameMap = new Map<string, Facility>();
+  const idMap = new Map<number, number>();
+
+  (items || []).forEach((f) => {
+    const normName = (f.name || '').trim().toLowerCase();
+    const existing = nameMap.get(normName);
+    if (existing) {
+      if (f.id && existing.id) {
+        idMap.set(f.id, existing.id);
+      }
+    } else {
+      nameMap.set(normName, f);
+      result.push(f);
+      if (f.id) idMap.set(f.id, f.id);
+    }
+  });
+
+  return { facilities: result, idMap };
+};
+
+export const deduplicateInspectors = (items: Inspector[]): { inspectors: Inspector[]; idMap: Map<number, number> } => {
+  const result: Inspector[] = [];
+  const emailMap = new Map<string, Inspector>();
+  const idMap = new Map<number, number>();
+
+  (items || []).forEach((u) => {
+    const normEmail = (u.email || '').trim().toLowerCase();
+    const existing = emailMap.get(normEmail);
+    if (existing) {
+      if (u.id && existing.id) {
+        idMap.set(u.id, existing.id);
+      }
+    } else {
+      let role = u.role;
+      const rLower = String(role || '').toLowerCase();
+      if (rLower.includes('админ') || rLower.includes('admin')) {
+        role = 'Администратор';
+      } else if (rLower.includes('старш') || rLower.includes('senior')) {
+        role = 'Старший инспектор';
+      } else {
+        role = 'Инспектор';
+      }
+      const cleanUser = { ...u, role };
+      emailMap.set(normEmail, cleanUser);
+      result.push(cleanUser);
+      if (u.id) idMap.set(u.id, u.id);
+    }
+  });
+
+  return { inspectors: result, idMap };
+};
+
+export const deduplicateEquipment = (items: Equipment[], facIdMap?: Map<number, number>): Equipment[] => {
+  const result: Equipment[] = [];
+  const keySet = new Set<string>();
+
+  (items || []).forEach((e) => {
+    const facId = (facIdMap && e.facility_id ? facIdMap.get(e.facility_id) : undefined) || e.facility_id;
+    const name = (e.name || '').trim().toLowerCase();
+    const type = (e.type || '').trim().toLowerCase();
+    const serial = (e.serial_number || '').trim().toLowerCase();
+    const key = `${facId}::${name}::${type}::${serial}`;
+
+    if (!keySet.has(key)) {
+      keySet.add(key);
+      result.push({ ...e, facility_id: facId });
+    }
+  });
+
+  return result;
+};
+
+export const deduplicateInspections = (
+  items: Inspection[],
+  facIdMap?: Map<number, number>,
+  inspIdMap?: Map<number, number>
+): Inspection[] => {
+  const result: Inspection[] = [];
+  const keySet = new Set<string>();
+
+  (items || []).forEach((ins) => {
+    const facId = (facIdMap && ins.facility_id ? facIdMap.get(ins.facility_id) : undefined) || ins.facility_id;
+    const inspId = (inspIdMap && ins.inspector_id ? inspIdMap.get(ins.inspector_id) : undefined) || ins.inspector_id;
+    const dt = ins.date || '';
+    const prescr = (ins.prescription_number || '').trim().toLowerCase();
+    const key = `${facId}::${inspId}::${dt}::${prescr}`;
+
+    if (!keySet.has(key)) {
+      keySet.add(key);
+      result.push({ ...ins, facility_id: facId, inspector_id: inspId });
+    }
+  });
+
+  return result;
+};
+
 // --- AUTH PAGE COMPONENT WITH REAL RFC 6238 TOTP TWO-FACTOR AUTHENTICATION ---
 function AuthScreen({
   onLogin,
@@ -4188,24 +4287,28 @@ export default function App() {
 
         if (fRes.status === 'fulfilled' && Array.isArray(fRes.value.data)) {
           const list = sanitizeLegacyIds(fRes.value.data);
-          setFacilities(list);
-          localStorage.setItem('app_facilities', JSON.stringify(list));
+          const { facilities: dedupedFac } = deduplicateFacilities(list);
+          setFacilities(dedupedFac);
+          localStorage.setItem('app_facilities', JSON.stringify(dedupedFac));
         }
         if (iRes.status === 'fulfilled' && Array.isArray(iRes.value.data)) {
           const list = sanitizeLegacyIds(iRes.value.data);
-          setInspectors(list);
-          localStorage.setItem('app_inspectors', JSON.stringify(list));
-          localStorage.setItem('inspectors_registry', JSON.stringify(list));
+          const { inspectors: dedupedInsp } = deduplicateInspectors(list);
+          setInspectors(dedupedInsp);
+          localStorage.setItem('app_inspectors', JSON.stringify(dedupedInsp));
+          localStorage.setItem('inspectors_registry', JSON.stringify(dedupedInsp));
         }
         if (eqRes.status === 'fulfilled' && Array.isArray(eqRes.value.data)) {
           const list = sanitizeLegacyIds(eqRes.value.data);
-          setEquipment(list);
-          localStorage.setItem('app_equipment', JSON.stringify(list));
+          const dedupedEq = deduplicateEquipment(list);
+          setEquipment(dedupedEq);
+          localStorage.setItem('app_equipment', JSON.stringify(dedupedEq));
         }
         if (inspRes.status === 'fulfilled' && Array.isArray(inspRes.value.data)) {
           const list = sanitizeLegacyIds(inspRes.value.data);
-          setInspections(list);
-          localStorage.setItem('app_inspections', JSON.stringify(list));
+          const dedupedInsp = deduplicateInspections(list);
+          setInspections(dedupedInsp);
+          localStorage.setItem('app_inspections', JSON.stringify(dedupedInsp));
         }
       } catch {}
     };
@@ -4720,19 +4823,24 @@ export default function App() {
           onAuditCreated={(entry) => setAuditLogs((prev) => [entry, ...prev])}
           showToast={showToast}
           onRestoreDatabase={(restoredData) => {
-            setFacilities(restoredData.facilities);
-            setInspections(restoredData.inspections);
-            setEquipment(restoredData.equipment);
-            setInspectors(restoredData.inspectors);
+            const { facilities: cleanFac, idMap: facMap } = deduplicateFacilities(restoredData.facilities);
+            const { inspectors: cleanInsp, idMap: inspMap } = deduplicateInspectors(restoredData.inspectors);
+            const cleanEq = deduplicateEquipment(restoredData.equipment, facMap);
+            const cleanInspList = deduplicateInspections(restoredData.inspections, facMap, inspMap);
+
+            setFacilities(cleanFac);
+            setInspections(cleanInspList);
+            setEquipment(cleanEq);
+            setInspectors(cleanInsp);
             setAuditLogs(restoredData.auditLogs);
 
-            localStorage.setItem('app_facilities', JSON.stringify(restoredData.facilities));
-            localStorage.setItem('app_inspections', JSON.stringify(restoredData.inspections));
-            localStorage.setItem('app_equipment', JSON.stringify(restoredData.equipment));
-            localStorage.setItem('app_inspectors', JSON.stringify(restoredData.inspectors));
-            localStorage.setItem('inspectors_registry', JSON.stringify(restoredData.inspectors));
+            localStorage.setItem('app_facilities', JSON.stringify(cleanFac));
+            localStorage.setItem('app_inspections', JSON.stringify(cleanInspList));
+            localStorage.setItem('app_equipment', JSON.stringify(cleanEq));
+            localStorage.setItem('app_inspectors', JSON.stringify(cleanInsp));
+            localStorage.setItem('inspectors_registry', JSON.stringify(cleanInsp));
             saveAuditLogs(restoredData.auditLogs);
-            showToast(`База данных успешно восстановлена (${restoredData.facilities.length} объектов, ${restoredData.inspections.length} проверок)`);
+            showToast(`База данных успешно восстановлена без дубликатов (${cleanFac.length} объектов, ${cleanInspList.length} проверок)`);
           }}
         />
       )}

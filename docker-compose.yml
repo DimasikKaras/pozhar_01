@@ -63,8 +63,7 @@ services:
     depends_on:
       - backend
     volumes:
-      - /opt/pozhnadzor/nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - /opt/pozhnadzor/ssl:/etc/nginx/ssl:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
     ports:
       - '443:443'
       - '80:80'

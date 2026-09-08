@@ -8,7 +8,7 @@ from urllib.parse import quote, unquote
 from fastapi import APIRouter, Depends, HTTPException, Response, Query, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, update, func
 
 from ..database import get_db
 from ..deps import get_current_user, require_roles
@@ -187,19 +187,112 @@ def build_full_backup_dict(db: Session) -> Dict[str, Any]:
     }
 
 
+def cleanup_all_database_duplicates(db: Session) -> Dict[str, int]:
+    """
+    Глубокая дедупликация базы данных PostgreSQL:
+    1. Схлопывание дубликатов объектов Facility (по нормализованному названию или кадастровому номеру);
+    2. Перепривязка оборудования и проверок к первичному объекту;
+    3. Схлопывание дубликатов оборудования Equipment (по facility_id, названию, типу и серийному номеру);
+    4. Схлопывание дубликатов проверок Inspection (по facility_id, inspector_id, дате и предписанию);
+    5. Схлопывание дубликатов инспекторов (по email).
+    """
+    fac_removed = 0
+    eq_removed = 0
+    insp_removed = 0
+    users_removed = 0
+
+    # 1. Дедупликация Facility
+    all_facilities = list(db.scalars(select(Facility).order_by(Facility.id.asc())))
+    fac_name_groups: Dict[str, List[Facility]] = {}
+    for f in all_facilities:
+        key = f.name.strip().lower() if f.name else f"id_{f.id}"
+        fac_name_groups.setdefault(key, []).append(f)
+
+    for key, group in fac_name_groups.items():
+        if len(group) > 1:
+            primary = group[0]
+            for dup in group[1:]:
+                # Переносим оборудование и проверки на primary
+                db.execute(update(Equipment).where(Equipment.facility_id == dup.id).values(facility_id=primary.id))
+                db.execute(update(Inspection).where(Inspection.facility_id == dup.id).values(facility_id=primary.id))
+                db.delete(dup)
+                fac_removed += 1
+
+    db.flush()
+
+    # 2. Дедупликация Equipment
+    all_equipment = list(db.scalars(select(Equipment).order_by(Equipment.id.asc())))
+    eq_groups: Dict[str, List[Equipment]] = {}
+    for e in all_equipment:
+        ser = (e.serial_number or "").strip().lower()
+        nm = (e.name or "").strip().lower()
+        tp = (e.type or "").strip().lower()
+        k = f"{e.facility_id}::{nm}::{tp}::{ser}"
+        eq_groups.setdefault(k, []).append(e)
+
+    for k, group in eq_groups.items():
+        if len(group) > 1:
+            # Оставляем первую запись, дубликаты удаляем
+            for dup in group[1:]:
+                db.delete(dup)
+                eq_removed += 1
+
+    db.flush()
+
+    # 3. Дедупликация Inspection
+    all_inspections = list(db.scalars(select(Inspection).order_by(Inspection.id.asc())))
+    insp_groups: Dict[str, List[Inspection]] = {}
+    for ins in all_inspections:
+        dt = str(ins.date) if ins.date else ""
+        pr = (ins.prescription_number or "").strip().lower()
+        k = f"{ins.facility_id}::{ins.inspector_id}::{dt}::{pr}"
+        insp_groups.setdefault(k, []).append(ins)
+
+    for k, group in insp_groups.items():
+        if len(group) > 1:
+            for dup in group[1:]:
+                db.delete(dup)
+                insp_removed += 1
+
+    db.flush()
+
+    # 4. Дедупликация Inspector по email
+    all_inspectors = list(db.scalars(select(Inspector).order_by(Inspector.id.asc())))
+    user_groups: Dict[str, List[Inspector]] = {}
+    for u in all_inspectors:
+        em = u.email.strip().lower() if u.email else ""
+        if em:
+            user_groups.setdefault(em, []).append(u)
+
+    for em, group in user_groups.items():
+        if len(group) > 1:
+            primary_user = group[0]
+            for dup in group[1:]:
+                db.execute(update(Inspection).where(Inspection.inspector_id == dup.id).values(inspector_id=primary_user.id))
+                db.delete(dup)
+                users_removed += 1
+
+    db.commit()
+
+    return {
+        "facilities_removed": fac_removed,
+        "equipment_removed": eq_removed,
+        "inspections_removed": insp_removed,
+        "inspectors_removed": users_removed
+    }
+
+
 def restore_data_from_dict(db_data: Dict[str, Any], db: Session, mode: str = "replace") -> Dict[str, Any]:
     """
-    Восстановление данных из словаря.
-    mode:
-      - 'replace': полная перезапись данных оборудования и проверок без задвоения записей;
-      - 'merge': слияние данных с обновлением совпадающих записей и предотвращением дубликатов.
+    Восстановление данных из словаря с полной защитой от дубликатов
+    и сохранением роли 'Старший инспектор' (RoleEnum.senior).
     """
     raw_inspectors = db_data.get("inspectors") or db_data.get("users") or []
     raw_facilities = db_data.get("facilities") or []
     raw_equipment = db_data.get("equipment") or []
     raw_inspections = db_data.get("inspections") or []
 
-    # 1. Восстановление сотрудников с сохранением password_hash
+    # 1. Восстановление сотрудников с сохранением password_hash и правильных ролей
     restored_users_count = 0
     inspector_id_map = {}
     for u in raw_inspectors:
@@ -208,9 +301,14 @@ def restore_data_from_dict(db_data: Dict[str, Any], db: Session, mode: str = "re
             continue
 
         role_str = str(u.get("role", "Инспектор")).strip().lower()
-        role_enum = RoleEnum.admin if ("админ" in role_str or "admin" in role_str) else RoleEnum.inspector
+        if "админ" in role_str or "admin" in role_str:
+            role_enum = RoleEnum.admin
+        elif "старш" in role_str or "senior" in role_str:
+            role_enum = RoleEnum.senior
+        else:
+            role_enum = RoleEnum.inspector
 
-        existing_user = db.scalar(select(Inspector).where(Inspector.email == email))
+        existing_user = db.scalar(select(Inspector).where(func.lower(func.trim(Inspector.email)) == email))
         pwd_hash = u.get("password_hash") or u.get("hashed_password")
         if not pwd_hash and u.get("password"):
             pwd_hash = hash_password(u.get("password"))
@@ -220,12 +318,10 @@ def restore_data_from_dict(db_data: Dict[str, Any], db: Session, mode: str = "re
             existing_user.rank = u.get("rank") or existing_user.rank
             existing_user.phone = u.get("phone") or existing_user.phone
             existing_user.role = role_enum
-            # Обновляем хэш пароля только если он явно присутствует в бэкапе
             if pwd_hash:
                 existing_user.password_hash = pwd_hash
             target_user = existing_user
         else:
-            # Сотрудник был удален или отсутствует в БД -> восстанавливаем с оригинальным хэшем!
             new_user = Inspector(
                 full_name=u.get("full_name", "Инспектор ГПН"),
                 rank=u.get("rank", "Сотрудник ГПН"),
@@ -244,21 +340,38 @@ def restore_data_from_dict(db_data: Dict[str, Any], db: Session, mode: str = "re
 
     db.commit()
 
-    # 2. Восстановление поднадзорных объектов
+    # 2. Восстановление поднадзорных объектов (дедупликация по имени и id)
     restored_fac_count = 0
     facility_id_map = {}
+    seen_fac_names = set()
+
     for f in raw_facilities:
-        f_name = f.get("name")
+        f_name = str(f.get("name") or "").strip()
         if not f_name:
             continue
 
+        norm_name = f_name.lower()
         risk_val = parse_risk_level(f.get("risk_level"))
+        cadastral = str(f.get("cadastral_number") or "").strip() or None
 
-        existing_fac = db.scalar(select(Facility).where(Facility.name == f_name))
+        # Ищем существующий объект: сначала по ID из бэкапа, затем по нормализованному названию
+        existing_fac = None
+        if f.get("id"):
+            existing_fac = db.get(Facility, f["id"])
+        if not existing_fac:
+            existing_fac = db.scalar(
+                select(Facility).where(func.lower(func.trim(Facility.name)) == norm_name)
+            )
+        if not existing_fac and cadastral:
+            existing_fac = db.scalar(
+                select(Facility).where(Facility.cadastral_number == cadastral)
+            )
+
         if existing_fac:
+            existing_fac.name = f_name
             existing_fac.address = f.get("address", existing_fac.address)
             existing_fac.risk_level = risk_val
-            existing_fac.cadastral_number = f.get("cadastral_number", existing_fac.cadastral_number)
+            existing_fac.cadastral_number = cadastral or existing_fac.cadastral_number
             existing_fac.responsible_person = f.get("responsible_person", existing_fac.responsible_person)
             target_fac = existing_fac
         else:
@@ -266,7 +379,7 @@ def restore_data_from_dict(db_data: Dict[str, Any], db: Session, mode: str = "re
                 name=f_name,
                 address=f.get("address", "г. Новосибирск"),
                 risk_level=risk_val,
-                cadastral_number=f.get("cadastral_number"),
+                cadastral_number=cadastral,
                 responsible_person=f.get("responsible_person")
             )
             db.add(new_fac)
@@ -275,6 +388,7 @@ def restore_data_from_dict(db_data: Dict[str, Any], db: Session, mode: str = "re
 
         if f.get("id"):
             facility_id_map[f["id"]] = target_fac.id
+        seen_fac_names.add(norm_name)
         restored_fac_count += 1
 
     db.commit()
@@ -291,20 +405,20 @@ def restore_data_from_dict(db_data: Dict[str, Any], db: Session, mode: str = "re
         db.commit()
         db.refresh(fallback_fac)
 
-    # Опорный инспектор на случай отсутствия инспектора
     fallback_insp = db.scalars(select(Inspector)).first()
 
-    # В РЕЖИМЕ REPLACE (полное восстановление) очищаем текущие проверки и оборудование,
-    # чтобы полностью исключить дублирование данных!
+    # В РЕЖИМЕ REPLACE (полное восстановление) очищаем старые проверки и оборудование
     if mode == "replace":
         db.execute(delete(Inspection))
         db.execute(delete(Equipment))
         db.commit()
 
-    # 3. Восстановление оборудования и СИЗ (с защитой от дублей)
+    # 3. Восстановление оборудования и СИЗ (с дедупликацией)
     restored_eq_count = 0
+    seen_equipment_keys = set()
+
     for e in raw_equipment:
-        eq_name = e.get("name") or e.get("type") or "Оборудование ПБ"
+        eq_name = str(e.get("name") or e.get("type") or "Оборудование ПБ").strip()
         orig_fac_id = e.get("facility_id")
         mapped_fac_id = facility_id_map.get(orig_fac_id, orig_fac_id)
         if not mapped_fac_id or not db.get(Facility, mapped_fac_id):
@@ -316,28 +430,31 @@ def restore_data_from_dict(db_data: Dict[str, Any], db: Session, mode: str = "re
         st_val = parse_equipment_status(e.get("status"))
         last_check = parse_date_safe(e.get("last_check_date"))
         next_check = parse_date_safe(e.get("next_check_date")) if e.get("next_check_date") else None
-        serial_no = e.get("serial_number")
+        serial_no = str(e.get("serial_number") or "").strip() or None
+        eq_type = str(e.get("type") or "Первичные средства пожаротушения").strip()
 
-        # Проверка на дубликат в режиме merge
+        # Дедупликационный ключ
+        eq_key = f"{mapped_fac_id}::{eq_name.lower()}::{eq_type.lower()}::{str(serial_no).lower()}"
+        if eq_key in seen_equipment_keys:
+            continue
+        seen_equipment_keys.add(eq_key)
+
         existing_eq = None
-        if mode == "merge":
-            if serial_no:
-                existing_eq = db.scalar(
-                    select(Equipment).where(
-                        Equipment.facility_id == mapped_fac_id,
-                        Equipment.serial_number == serial_no
-                    )
+        if serial_no:
+            existing_eq = db.scalar(
+                select(Equipment).where(
+                    Equipment.facility_id == mapped_fac_id,
+                    Equipment.serial_number == serial_no
                 )
-            if not existing_eq and e.get("id"):
-                existing_eq = db.get(Equipment, e["id"])
-            if not existing_eq:
-                existing_eq = db.scalar(
-                    select(Equipment).where(
-                        Equipment.facility_id == mapped_fac_id,
-                        Equipment.name == eq_name,
-                        Equipment.type == e.get("type", "Первичные средства пожаротушения")
-                    )
+            )
+        if not existing_eq:
+            existing_eq = db.scalar(
+                select(Equipment).where(
+                    Equipment.facility_id == mapped_fac_id,
+                    func.lower(func.trim(Equipment.name)) == eq_name.lower(),
+                    func.lower(func.trim(Equipment.type)) == eq_type.lower()
                 )
+            )
 
         if existing_eq:
             existing_eq.status = st_val
@@ -348,7 +465,7 @@ def restore_data_from_dict(db_data: Dict[str, Any], db: Session, mode: str = "re
             new_eq = Equipment(
                 facility_id=mapped_fac_id,
                 name=eq_name,
-                type=e.get("type", "Первичные средства пожаротушения"),
+                type=eq_type,
                 serial_number=serial_no,
                 status=st_val,
                 last_check_date=last_check,
@@ -361,8 +478,10 @@ def restore_data_from_dict(db_data: Dict[str, Any], db: Session, mode: str = "re
 
     db.commit()
 
-    # 4. Восстановление проверок (с защитой от дублей)
+    # 4. Восстановление проверок (с дедупликацией)
     restored_insp_count = 0
+    seen_inspection_keys = set()
+
     for ins in raw_inspections:
         orig_fac_id = ins.get("facility_id")
         orig_insp_id = ins.get("inspector_id")
@@ -381,25 +500,26 @@ def restore_data_from_dict(db_data: Dict[str, Any], db: Session, mode: str = "re
 
         res_val = parse_inspection_result(ins.get("result"))
         insp_date = parse_date_safe(ins.get("date"))
-        prescr = ins.get("prescription_number")
+        prescr = str(ins.get("prescription_number") or "").strip() or None
 
-        # Проверка на дубликат в режиме merge
+        insp_key = f"{mapped_fac_id}::{mapped_insp_id}::{str(insp_date)}::{str(prescr).lower()}"
+        if insp_key in seen_inspection_keys:
+            continue
+        seen_inspection_keys.add(insp_key)
+
         existing_insp = None
-        if mode == "merge":
-            if prescr:
-                existing_insp = db.scalar(
-                    select(Inspection).where(Inspection.prescription_number == prescr)
+        if prescr:
+            existing_insp = db.scalar(
+                select(Inspection).where(Inspection.prescription_number == prescr)
+            )
+        if not existing_insp:
+            existing_insp = db.scalar(
+                select(Inspection).where(
+                    Inspection.facility_id == mapped_fac_id,
+                    Inspection.inspector_id == mapped_insp_id,
+                    Inspection.date == insp_date
                 )
-            if not existing_insp and ins.get("id"):
-                existing_insp = db.get(Inspection, ins["id"])
-            if not existing_insp:
-                existing_insp = db.scalar(
-                    select(Inspection).where(
-                        Inspection.facility_id == mapped_fac_id,
-                        Inspection.date == insp_date,
-                        Inspection.inspector_id == mapped_insp_id
-                    )
-                )
+            )
 
         if existing_insp:
             existing_insp.result = res_val
@@ -420,15 +540,37 @@ def restore_data_from_dict(db_data: Dict[str, Any], db: Session, mode: str = "re
 
     db.commit()
 
+    # Финальная чистка всех накопившихся дубликатов
+    cleanup_stats = cleanup_all_database_duplicates(db)
+
     return {
         "status": "ok",
-        "message": "База данных успешно восстановлена",
+        "message": "База данных успешно восстановлена без дубликатов",
         "mode": mode,
         "restored_inspectors": restored_users_count,
         "restored_facilities": restored_fac_count,
         "restored_equipment": restored_eq_count,
-        "restored_inspections": restored_insp_count
+        "restored_inspections": restored_insp_count,
+        "deduplicated": cleanup_stats
     }
+
+
+@router.post("/cleanup-duplicates")
+def cleanup_database_duplicates_endpoint(
+    db: Session = Depends(get_db),
+    current_user: Inspector = Depends(require_roles(RoleEnum.admin, RoleEnum.senior))
+):
+    """Принудительная очистка всех дубликатов в базе данных PostgreSQL."""
+    try:
+        stats = cleanup_all_database_duplicates(db)
+        return {
+            "status": "ok",
+            "message": "База данных успешно очищена от дубликатов",
+            "removed": stats
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Ошибка очистки дубликатов: {str(e)}")
 
 
 # ==============================================================================

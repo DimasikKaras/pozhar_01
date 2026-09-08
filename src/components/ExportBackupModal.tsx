@@ -26,7 +26,9 @@ import {
   ShieldCheck,
   Key,
   Eye,
-  EyeOff
+  EyeOff,
+  Sparkles,
+  CheckCheck
 } from 'lucide-react';
 import { Facility, Inspection, Equipment, Inspector, AuditLogEntry, BackupPayload, isUserAdmin } from '../types';
 import {
@@ -488,33 +490,94 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
 
     setIsRestoring(true);
     try {
-      let finalFacilities = parsedBackup.facilities;
-      let finalInspections = parsedBackup.inspections;
-      let finalEquipment = parsedBackup.equipment;
-      let finalInspectors = parsedBackup.inspectors;
-      let finalAuditLogs = parsedBackup.auditLogs;
+      // 1. Нормализация ролей инспекторов с поддержкой 'Старший инспектор'
+      const rawInspectors = (parsedBackup.inspectors || (parsedBackup as any).users || []).map((insp: any) => {
+        let role = insp.role;
+        const roleLower = String(role || '').toLowerCase();
+        if (roleLower.includes('админ') || roleLower.includes('admin')) {
+          role = 'Администратор';
+        } else if (roleLower.includes('старш') || roleLower.includes('senior')) {
+          role = 'Старший инспектор';
+        } else {
+          role = 'Инспектор';
+        }
+        return { ...insp, role };
+      });
+
+      // 2. Объединение в зависимости от режима
+      let rawFacilities = parsedBackup.facilities || [];
+      let rawInspections = parsedBackup.inspections || [];
+      let rawEquipment = parsedBackup.equipment || [];
+      let finalAuditLogs = parsedBackup.auditLogs || [];
 
       if (restoreMode === 'merge') {
-        const facMap = new Map(facilities.map((f) => [f.id, f]));
-        parsedBackup.facilities.forEach((f) => facMap.set(f.id, f));
-        finalFacilities = Array.from(facMap.values());
-
-        const inspMap = new Map(inspections.map((i) => [i.id, i]));
-        parsedBackup.inspections.forEach((i) => inspMap.set(i.id, i));
-        finalInspections = Array.from(inspMap.values());
-
-        const eqMap = new Map(equipment.map((e) => [e.id, e]));
-        parsedBackup.equipment.forEach((e) => eqMap.set(e.id, e));
-        finalEquipment = Array.from(eqMap.values());
-
-        const userMap = new Map(inspectors.map((u) => [u.id, u]));
-        parsedBackup.inspectors.forEach((u) => userMap.set(u.id, u));
-        finalInspectors = Array.from(userMap.values());
-
-        finalAuditLogs = [...parsedBackup.auditLogs, ...auditLogs];
+        rawFacilities = [...facilities, ...rawFacilities];
+        rawEquipment = [...equipment, ...rawEquipment];
+        rawInspections = [...inspections, ...rawInspections];
+        finalAuditLogs = [...(parsedBackup.auditLogs || []), ...auditLogs];
       }
 
-      // СОХРАНЕНИЕ ПАРОЛЕЙ И ХЭШЕЙ ВОССТАНОВЛЕННЫХ СОТРУДНИКОВ, ЧТОБЫ ОНИ МОГЛИ ВОЙТИ
+      // 3. Дедупликация объектов и построение карты перенаправления ID
+      const facMap = new Map<string, Facility>();
+      const facIdRedirect = new Map<number, number>();
+      const finalFacilities: Facility[] = [];
+
+      rawFacilities.forEach((f: any) => {
+        const norm = (f.name || '').trim().toLowerCase();
+        const ex = facMap.get(norm);
+        if (ex) {
+          if (f.id && ex.id) facIdRedirect.set(f.id, ex.id);
+        } else {
+          facMap.set(norm, f);
+          finalFacilities.push(f);
+          if (f.id) facIdRedirect.set(f.id, f.id);
+        }
+      });
+
+      // 4. Дедупликация сотрудников по email
+      const userMap = new Map<string, Inspector>();
+      const userIdRedirect = new Map<number, number>();
+      const finalInspectors: Inspector[] = [];
+
+      const candidateInspectors = restoreMode === 'merge' ? [...inspectors, ...rawInspectors] : rawInspectors;
+      candidateInspectors.forEach((u: any) => {
+        const norm = (u.email || '').trim().toLowerCase();
+        const ex = userMap.get(norm);
+        if (ex) {
+          if (u.id && ex.id) userIdRedirect.set(u.id, ex.id);
+        } else {
+          userMap.set(norm, u);
+          finalInspectors.push(u);
+          if (u.id) userIdRedirect.set(u.id, u.id);
+        }
+      });
+
+      // 5. Дедупликация оборудования
+      const eqKeys = new Set<string>();
+      const finalEquipment: Equipment[] = [];
+      rawEquipment.forEach((e: any) => {
+        const fId = (e.facility_id ? facIdRedirect.get(e.facility_id) : undefined) || e.facility_id;
+        const k = `${fId}::${(e.name || '').trim().toLowerCase()}::${(e.type || '').trim().toLowerCase()}::${(e.serial_number || '').trim().toLowerCase()}`;
+        if (!eqKeys.has(k)) {
+          eqKeys.add(k);
+          finalEquipment.push({ ...e, facility_id: fId });
+        }
+      });
+
+      // 6. Дедупликация проверок
+      const inspKeys = new Set<string>();
+      const finalInspections: Inspection[] = [];
+      rawInspections.forEach((ins: any) => {
+        const fId = (ins.facility_id ? facIdRedirect.get(ins.facility_id) : undefined) || ins.facility_id;
+        const uId = (ins.inspector_id ? userIdRedirect.get(ins.inspector_id) : undefined) || ins.inspector_id;
+        const k = `${fId}::${uId}::${ins.date || ''}::${(ins.prescription_number || '').trim().toLowerCase()}`;
+        if (!inspKeys.has(k)) {
+          inspKeys.add(k);
+          finalInspections.push({ ...ins, facility_id: fId, inspector_id: uId });
+        }
+      });
+
+      // СОХРАНЕНИЕ ПАРОЛЕЙ И ХЭШЕЙ ВОССТАНОВЛЕННЫХ СОТРУДНИКОВ
       try {
         const passRaw = localStorage.getItem('app_user_passwords') || '{}';
         const passMap = JSON.parse(passRaw);
@@ -554,7 +617,7 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
         onAuditCreated(restoreLog);
       }
 
-      // Отправляем восстановление на бэкенд API с сохранением хэшей паролей
+      // Отправляем восстановление на бэкенд API с сохранением хэшей паролей и предотвращением дубликатов
       try {
         api.post('/database/restore', {
           facilities: finalFacilities,
@@ -566,7 +629,7 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
         }).catch(() => {});
       } catch {}
 
-      showToast?.('База данных успешно восстановлена из файла на компьютере!');
+      showToast?.('База данных успешно восстановлена без дубликатов!');
       onClose();
     } catch (e: any) {
       setParseError(`Не удалось применить бэкап: ${e.message}`);
@@ -769,6 +832,131 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
     }
     if (selectedServerBackup === filename) {
       setSelectedServerBackup(null);
+    }
+  };
+
+  const [isCleaningDuplicates, setIsCleaningDuplicates] = useState(false);
+  const [cleanupResult, setCleanupResult] = useState<string | null>(null);
+
+  // Очистка дубликатов в базе данных и локальном стейте
+  const handleCleanDatabaseDuplicates = async () => {
+    setIsCleaningDuplicates(true);
+    setCleanupResult(null);
+    try {
+      let serverStats: any = null;
+      try {
+        const res = await api.post('/database/cleanup-duplicates');
+        if (res.data && res.data.removed) {
+          serverStats = res.data.removed;
+        }
+      } catch (e) {
+        console.warn('Серверная очистка дубликатов:', e);
+      }
+
+      // Выполняем дедупликацию текущих данных в памяти и в стейте
+      const facMap = new Map<string, Facility>();
+      const facIdRedirect = new Map<number, number>();
+      const uniqueFacilities: Facility[] = [];
+
+      facilities.forEach((f) => {
+        const norm = (f.name || '').trim().toLowerCase();
+        const ex = facMap.get(norm);
+        if (ex) {
+          if (f.id && ex.id) facIdRedirect.set(f.id, ex.id);
+        } else {
+          facMap.set(norm, f);
+          uniqueFacilities.push(f);
+          if (f.id) facIdRedirect.set(f.id, f.id);
+        }
+      });
+
+      const userMap = new Map<string, Inspector>();
+      const userIdRedirect = new Map<number, number>();
+      const uniqueInspectors: Inspector[] = [];
+
+      inspectors.forEach((u) => {
+        const norm = (u.email || '').trim().toLowerCase();
+        const ex = userMap.get(norm);
+        if (ex) {
+          if (u.id && ex.id) userIdRedirect.set(u.id, ex.id);
+        } else {
+          let role = u.role;
+          const rLower = String(role || '').toLowerCase();
+          if (rLower.includes('админ') || rLower.includes('admin')) {
+            role = 'Администратор';
+          } else if (rLower.includes('старш') || rLower.includes('senior')) {
+            role = 'Старший инспектор';
+          } else {
+            role = 'Инспектор';
+          }
+          const cleanU = { ...u, role };
+          userMap.set(norm, cleanU);
+          uniqueInspectors.push(cleanU);
+          if (u.id) userIdRedirect.set(u.id, u.id);
+        }
+      });
+
+      const eqKeys = new Set<string>();
+      const uniqueEquipment: Equipment[] = [];
+      equipment.forEach((e) => {
+        const fId = (e.facility_id ? facIdRedirect.get(e.facility_id) : undefined) || e.facility_id;
+        const k = `${fId}::${(e.name || '').trim().toLowerCase()}::${(e.type || '').trim().toLowerCase()}::${(e.serial_number || '').trim().toLowerCase()}`;
+        if (!eqKeys.has(k)) {
+          eqKeys.add(k);
+          uniqueEquipment.push({ ...e, facility_id: fId });
+        }
+      });
+
+      const inspKeys = new Set<string>();
+      const uniqueInspections: Inspection[] = [];
+      inspections.forEach((ins) => {
+        const fId = (ins.facility_id ? facIdRedirect.get(ins.facility_id) : undefined) || ins.facility_id;
+        const uId = (ins.inspector_id ? userIdRedirect.get(ins.inspector_id) : undefined) || ins.inspector_id;
+        const k = `${fId}::${uId}::${ins.date || ''}::${(ins.prescription_number || '').trim().toLowerCase()}`;
+        if (!inspKeys.has(k)) {
+          inspKeys.add(k);
+          uniqueInspections.push({ ...ins, facility_id: fId, inspector_id: uId });
+        }
+      });
+
+      const facDiff = facilities.length - uniqueFacilities.length;
+      const eqDiff = equipment.length - uniqueEquipment.length;
+      const inspDiff = inspections.length - uniqueInspections.length;
+      const userDiff = inspectors.length - uniqueInspectors.length;
+      const totalLocalRemoved = facDiff + eqDiff + inspDiff + userDiff;
+
+      const auditEntry = createAuditEntry(
+        currentUser,
+        'Очистка базы от дубликатов',
+        'Вся база данных (PostgreSQL & Кэш)',
+        `Удалено дубликатов: объектов ${facDiff}, оборудования ${eqDiff}, проверок ${inspDiff}, сотрудников ${userDiff}`
+      );
+
+      if (onRestoreDatabase) {
+        onRestoreDatabase({
+          facilities: uniqueFacilities,
+          inspectors: uniqueInspectors,
+          equipment: uniqueEquipment,
+          inspections: uniqueInspections,
+          auditLogs: [auditEntry, ...auditLogs]
+        });
+      }
+
+      let msg = '';
+      if (serverStats && (serverStats.facilities_removed > 0 || serverStats.equipment_removed > 0 || serverStats.inspections_removed > 0)) {
+        msg = `Удалено дубликатов: объектов: ${serverStats.facilities_removed}, оборудования: ${serverStats.equipment_removed}, проверок: ${serverStats.inspections_removed}`;
+      } else if (totalLocalRemoved > 0) {
+        msg = `Успешно очищено дубликатов: ${totalLocalRemoved} записей`;
+      } else {
+        msg = 'Дубликатов не обнаружено. База данных полностью чиста!';
+      }
+
+      setCleanupResult(msg);
+      showToast?.(msg);
+    } catch (err: any) {
+      setCleanupResult(`Ошибка очистки: ${err.message}`);
+    } finally {
+      setIsCleaningDuplicates(false);
     }
   };
 
@@ -1176,6 +1364,40 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
           ) : (
             /* ВКЛАДКА ВОССТАНОВЛЕНИЯ (RESTORE) */
             <div className="space-y-4">
+              {/* Блок очистки дубликатов базы данных */}
+              <div className="bg-gradient-to-r from-amber-50 to-orange-50 border border-amber-200/80 rounded-2xl p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-xs">
+                <div className="flex items-start gap-3">
+                  <div className="p-2.5 bg-amber-500/15 text-amber-700 rounded-xl shrink-0 mt-0.5 sm:mt-0">
+                    <Sparkles className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h4 className="text-xs font-black text-slate-900">Устранение дубликатов в один клик</h4>
+                    <p className="text-[11px] text-slate-600 mt-0.5">
+                      Схлопывает повторяющиеся объекты, оборудование и проверки, сохраняя историю и правильные роли сотрудников.
+                    </p>
+                    {cleanupResult && (
+                      <p className="text-[11px] font-bold text-emerald-700 mt-1 flex items-center gap-1.5 animate-fadeIn">
+                        <CheckCheck className="w-4 h-4 text-emerald-600 shrink-0" />
+                        <span>{cleanupResult}</span>
+                      </p>
+                    )}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleCleanDatabaseDuplicates}
+                  disabled={isCleaningDuplicates}
+                  className="px-3.5 py-2 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white font-bold text-xs rounded-xl shadow-xs transition-all flex items-center gap-2 shrink-0 cursor-pointer active:scale-95 self-end sm:self-auto"
+                >
+                  {isCleaningDuplicates ? (
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Sparkles className="w-4 h-4" />
+                  )}
+                  <span>{isCleaningDuplicates ? 'Очистка...' : 'Очистить дубликаты'}</span>
+                </button>
+              </div>
+
               {/* Переключатель: восстановить с ПК или из Docker */}
               <div>
                 <label className="text-xs font-black text-slate-800 uppercase tracking-wider block mb-2">
