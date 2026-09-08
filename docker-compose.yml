@@ -38,6 +38,9 @@ services:
       SMTP_USER: Bykov8642@yandex.ru
       SMTP_PASS: dqabciwhhmekfxdr
       SMTP_FROM: '"ПожНадзор.pro Служба безопасности" <Bykov8642@yandex.ru>'
+      BACKUP_DIR: /backups
+    volumes:
+      - ./backups:/backups
     ports:
       - '8000:8000'
 
