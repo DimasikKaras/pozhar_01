@@ -19,6 +19,14 @@ class InspectorRegister(InspectorBase):
     password: str = Field(min_length=6)
     admin_code: Optional[str] = None
 
+class InspectorUpdate(BaseModel):
+    full_name: Optional[str] = None
+    rank: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[EmailStr] = None
+    role: Optional[RoleEnum] = None
+    password: Optional[str] = None
+
 class InspectorOut(InspectorBase):
     id: int
     model_config = ConfigDict(from_attributes=True)

@@ -5,7 +5,7 @@ from sqlalchemy import select, delete, or_
 from sqlalchemy.orm import Session
 from ..database import get_db
 from ..models import Inspector, Inspection, RefreshToken, AuditLog, RoleEnum
-from ..schemas import InspectorOut, InspectorRegister
+from ..schemas import InspectorOut, InspectorRegister, InspectorUpdate
 from ..security import hash_password
 
 router = APIRouter(prefix='/inspectors', tags=['inspectors'])
@@ -91,3 +91,40 @@ def delete_inspector_post(payload: DeleteRequest, db: Session = Depends(get_db))
     if item:
         return _execute_full_delete(db, item)
     return {'status': 'not_found'}
+
+@router.put('/{inspector_id}', response_model=InspectorOut)
+@router.put('/{inspector_id}/', response_model=InspectorOut)
+@router.patch('/{inspector_id}', response_model=InspectorOut)
+@router.patch('/{inspector_id}/', response_model=InspectorOut)
+def update_inspector(inspector_id: int, payload: InspectorUpdate, db: Session = Depends(get_db)):
+    item = db.get(Inspector, inspector_id)
+    if not item:
+        raise HTTPException(status_code=404, detail='Инспектор не найден')
+
+    if payload.email is not None:
+        clean_email = payload.email.strip().lower()
+        duplicate = db.scalar(
+            select(Inspector).where(Inspector.email == clean_email, Inspector.id != inspector_id)
+        )
+        if duplicate:
+            raise HTTPException(status_code=400, detail='Инспектор с таким Email уже существует')
+        item.email = clean_email
+
+    if payload.full_name is not None:
+        item.full_name = payload.full_name.strip()
+
+    if payload.rank is not None:
+        item.rank = payload.rank.strip()
+
+    if payload.phone is not None:
+        item.phone = payload.phone.strip()
+
+    if payload.role is not None:
+        item.role = payload.role
+
+    if payload.password:
+        item.password_hash = hash_password(payload.password)
+
+    db.commit()
+    db.refresh(item)
+    return item

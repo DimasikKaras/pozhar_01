@@ -3298,6 +3298,24 @@ function InspectionsView({
 }
 
 // --- INSPECTORS COMPONENT ---
+const MCHS_RANKS = [
+  'Рядовой внутренней службы',
+  'Младший сержант внутренней службы',
+  'Сержант внутренней службы',
+  'Старший сержант внутренней службы',
+  'Старшина внутренней службы',
+  'Прапорщик внутренней службы',
+  'Старший прапорщик внутренней службы',
+  'Младший лейтенант внутренней службы',
+  'Лейтенант внутренней службы',
+  'Старший лейтенант внутренней службы',
+  'Капитан внутренней службы',
+  'Майор внутренней службы',
+  'Подполковник внутренней службы',
+  'Полковник внутренней службы',
+  'Генерал-майор внутренней службы'
+];
+
 function InspectorsView({
   inspectors,
   currentUser,
@@ -3311,9 +3329,21 @@ function InspectorsView({
 }) {
   const [search, setSearch] = useState('');
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [editingInspector, setEditingInspector] = useState<Inspector | null>(null);
   const [modalError, setModalError] = useState('');
-  const [formData, setFormData] = useState<Partial<Inspector>>({
-    full_name: '',
+  const [formData, setFormData] = useState<{
+    id?: number;
+    lastName: string;
+    firstName: string;
+    middleName: string;
+    rank: string;
+    phone: string;
+    email: string;
+    role: Role;
+  }>({
+    lastName: '',
+    firstName: '',
+    middleName: '',
     rank: 'Лейтенант внутренней службы',
     phone: '',
     email: '',
@@ -3334,18 +3364,62 @@ function InspectorsView({
     });
   }, [inspectors, search]);
 
+  const handleOpenAddModal = () => {
+    setEditingInspector(null);
+    setModalError('');
+    setFormData({
+      lastName: '',
+      firstName: '',
+      middleName: '',
+      rank: 'Лейтенант внутренней службы',
+      phone: '',
+      email: '',
+      role: 'Инспектор'
+    });
+    setIsModalOpen(true);
+  };
+
+  const handleOpenEditModal = (inspector: Inspector) => {
+    const parts = (inspector.full_name || '').trim().split(/\s+/);
+    const lastName = parts[0] || '';
+    const firstName = parts[1] || '';
+    const middleName = parts.slice(2).join(' ') || '';
+    setEditingInspector(inspector);
+    setModalError('');
+    setFormData({
+      id: inspector.id,
+      lastName,
+      firstName,
+      middleName,
+      rank: inspector.rank || 'Лейтенант внутренней службы',
+      phone: inspector.phone || '',
+      email: inspector.email || '',
+      role: inspector.role || 'Инспектор'
+    });
+    setIsModalOpen(true);
+  };
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     setModalError('');
 
+    const trimmedLast = formData.lastName.trim();
+    const trimmedFirst = formData.firstName.trim();
+    const trimmedMiddle = formData.middleName.trim();
     const trimmedEmail = (formData.email || '').trim();
-    const trimmedName = (formData.full_name || '').trim();
     const trimmedPhone = (formData.phone || '').trim();
 
-    if (!trimmedName) {
-      setModalError('Укажите ФИО сотрудника');
+    if (!trimmedLast) {
+      setModalError('Укажите фамилию сотрудника');
       return;
     }
+
+    if (!trimmedFirst) {
+      setModalError('Укажите имя сотрудника');
+      return;
+    }
+
+    const full_name = [trimmedLast, trimmedFirst, trimmedMiddle].filter(Boolean).join(' ');
 
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
       setModalError('Укажите корректный служебный Email');
@@ -3357,7 +3431,7 @@ function InspectorsView({
       return;
     }
 
-    // Check duplicate
+    // Check duplicate email (excluding currently edited inspector)
     const isDuplicate = inspectors.some(
       (insp) => (!formData.id || insp.id !== formData.id) && insp.email.trim().toLowerCase() === trimmedEmail.toLowerCase()
     );
@@ -3367,21 +3441,28 @@ function InspectorsView({
       return;
     }
 
+    // Safety check: do not allow removing the last administrator
+    if (editingInspector && editingInspector.role === 'Администратор' && formData.role !== 'Администратор') {
+      const remainingAdmins = inspectors.filter(
+        (i) => i.role === 'Администратор' && i.id !== editingInspector.id
+      );
+      if (remainingAdmins.length === 0) {
+        setModalError('Невозможно снять роль Администратора: в системе должен оставаться как минимум один Администратор.');
+        return;
+      }
+    }
+
     onSave?.({
-      ...formData,
-      full_name: trimmedName,
+      ...(formData.id ? { id: formData.id } : {}),
+      full_name,
+      rank: formData.rank,
+      role: formData.role,
       email: trimmedEmail,
       phone: trimmedPhone ? normalizePhoneNumber(trimmedPhone) : '+7 (999) 000-00-00'
     });
 
     setIsModalOpen(false);
-    setFormData({
-      full_name: '',
-      rank: 'Лейтенант внутренней службы',
-      phone: '',
-      email: '',
-      role: 'Инспектор'
-    });
+    setEditingInspector(null);
   };
 
   const handleDeleteClick = (targetInspector: Inspector) => {
@@ -3443,7 +3524,7 @@ function InspectorsView({
           {(isAdmin || isSenior) && (
             <button
               type="button"
-              onClick={() => setIsModalOpen(true)}
+              onClick={handleOpenAddModal}
               className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-xl text-xs font-bold shadow-md shadow-red-600/20 transition-all cursor-pointer shrink-0"
             >
               <Plus className="w-4 h-4 stroke-[2.5]" />
@@ -3487,12 +3568,22 @@ function InspectorsView({
                         Вы
                       </span>
                     )}
+                    {isAdmin && (
+                      <button
+                        type="button"
+                        onClick={() => handleOpenEditModal(inspector)}
+                        title="Редактировать данные сотрудника (ФИО, звание, роль)"
+                        className="p-1.5 text-slate-500 hover:text-blue-600 rounded-lg hover:bg-blue-50 transition-colors cursor-pointer"
+                      >
+                        <Pencil className="w-3.5 h-3.5" />
+                      </button>
+                    )}
                     {canDeleteThis && onDelete && (
                       <button
                         type="button"
                         onClick={() => handleDeleteClick(inspector)}
                         title="Удалить из реестра"
-                        className="p-1 text-slate-400 hover:text-rose-600 rounded-lg hover:bg-rose-50 transition-colors cursor-pointer"
+                        className="p-1.5 text-slate-400 hover:text-rose-600 rounded-lg hover:bg-rose-50 transition-colors cursor-pointer"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
@@ -3528,23 +3619,32 @@ function InspectorsView({
         })}
       </div>
 
-      {/* Modal Add Inspector */}
+      {/* Modal Add / Edit Inspector */}
       {isModalOpen && (
         <div className="fixed inset-0 bg-slate-950/65 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4 z-50 animate-fadeIn">
           <div className="bg-white rounded-2xl sm:rounded-3xl w-full max-w-lg max-h-[92vh] flex flex-col shadow-2xl border border-slate-200 overflow-hidden">
             <div className="p-4 sm:p-6 bg-slate-900 text-white flex items-center justify-between shrink-0">
               <div className="flex items-center gap-3 min-w-0">
                 <div className="p-2.5 bg-red-600 rounded-xl shrink-0">
-                  <Users className="w-5 h-5 text-white" />
+                  {editingInspector ? <Pencil className="w-5 h-5 text-white" /> : <Users className="w-5 h-5 text-white" />}
                 </div>
                 <div className="min-w-0">
-                  <h3 className="font-bold text-base sm:text-lg truncate">Добавление инспектора ГПН</h3>
-                  <p className="text-xs text-slate-400">Внесение сотрудника в кадровый состав реестра</p>
+                  <h3 className="font-bold text-base sm:text-lg truncate">
+                    {editingInspector ? 'Редактирование данных инспектора' : 'Добавление инспектора ГПН'}
+                  </h3>
+                  <p className="text-xs text-slate-400">
+                    {editingInspector
+                      ? 'Изменение ФИО, звания, роли доступа и контактов'
+                      : 'Внесение сотрудника в кадровый состав реестра'}
+                  </p>
                 </div>
               </div>
               <button
                 type="button"
-                onClick={() => setIsModalOpen(false)}
+                onClick={() => {
+                  setIsModalOpen(false);
+                  setEditingInspector(null);
+                }}
                 className="p-1 text-slate-400 hover:text-white rounded-lg cursor-pointer shrink-0"
               >
                 <X className="w-5 h-5" />
@@ -3559,19 +3659,57 @@ function InspectorsView({
                 </div>
               )}
 
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1.5">
+                    Фамилия *
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="Сергеев"
+                    value={formData.lastName}
+                    onChange={(e) => setFormData({ ...formData, lastName: e.target.value })}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-red-500/20 font-medium"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1.5">
+                    Имя *
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="Алексей"
+                    value={formData.firstName}
+                    onChange={(e) => setFormData({ ...formData, firstName: e.target.value })}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-red-500/20 font-medium"
+                  />
+                </div>
+              </div>
+
               <div>
                 <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1.5">
-                  ФИО инспектора *
+                  Отчество (при наличии)
                 </label>
                 <input
                   type="text"
-                  required
-                  placeholder="Сергеев Алексей Викторович"
-                  value={formData.full_name}
-                  onChange={(e) => setFormData({ ...formData, full_name: e.target.value })}
+                  placeholder="Викторович"
+                  value={formData.middleName}
+                  onChange={(e) => setFormData({ ...formData, middleName: e.target.value })}
                   className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-red-500/20 font-medium"
                 />
               </div>
+
+              {(formData.lastName || formData.firstName) && (
+                <div className="px-3.5 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-600 flex items-center justify-between">
+                  <span className="font-semibold text-slate-500">Полное ФИО:</span>
+                  <span className="font-bold text-slate-900">
+                    {[formData.lastName.trim(), formData.firstName.trim(), formData.middleName.trim()].filter(Boolean).join(' ')}
+                  </span>
+                </div>
+              )}
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
@@ -3583,12 +3721,14 @@ function InspectorsView({
                     onChange={(e) => setFormData({ ...formData, rank: e.target.value })}
                     className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-red-500/20 font-medium cursor-pointer"
                   >
-                    <option value="Лейтенант внутренней службы">Лейтенант вн. сл.</option>
-                    <option value="Старший лейтенант внутренней службы">Ст. лейтенант вн. сл.</option>
-                    <option value="Капитан внутренней службы">Капитан вн. сл.</option>
-                    <option value="Майор внутренней службы">Майор вн. сл.</option>
-                    <option value="Подполковник внутренней службы">Подполковник вн. сл.</option>
-                    <option value="Полковник внутренней службы">Полковник вн. сл.</option>
+                    {!MCHS_RANKS.includes(formData.rank) && formData.rank && (
+                      <option value={formData.rank}>{formData.rank}</option>
+                    )}
+                    {MCHS_RANKS.map((r) => (
+                      <option key={r} value={r}>
+                        {r}
+                      </option>
+                    ))}
                   </select>
                 </div>
 
@@ -3599,7 +3739,8 @@ function InspectorsView({
                   <select
                     value={formData.role}
                     onChange={(e) => setFormData({ ...formData, role: e.target.value as Role })}
-                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-red-500/20 font-medium cursor-pointer"
+                    disabled={!isAdmin && !!editingInspector}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-red-500/20 font-medium cursor-pointer disabled:opacity-60"
                   >
                     <option value="Инспектор">Инспектор</option>
                     <option value="Старший инспектор">Старший инспектор</option>
@@ -3640,7 +3781,10 @@ function InspectorsView({
               <div className="pt-4 border-t border-slate-100 flex items-center justify-end gap-3">
                 <button
                   type="button"
-                  onClick={() => setIsModalOpen(false)}
+                  onClick={() => {
+                    setIsModalOpen(false);
+                    setEditingInspector(null);
+                  }}
                   className="px-4 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs rounded-xl cursor-pointer"
                 >
                   Отмена
@@ -3650,7 +3794,7 @@ function InspectorsView({
                   className="px-5 py-2.5 bg-red-600 hover:bg-red-700 text-white font-bold text-xs rounded-xl shadow-md shadow-red-600/30 flex items-center gap-2 cursor-pointer"
                 >
                   <Check className="w-4 h-4 stroke-[2.5]" />
-                  Зарегистрировать сотрудника
+                  {editingInspector ? 'Сохранить изменения' : 'Зарегистрировать сотрудника'}
                 </button>
               </div>
             </form>
@@ -4346,10 +4490,64 @@ export default function App() {
   const handleSaveInspector = async (inspData: Partial<Inspector>) => {
     try {
       if (inspData.id) {
-        setInspectors((prev) =>
-          prev.map((i) => (i.id === inspData.id ? ({ ...i, ...inspData } as Inspector) : i))
-        );
-        showToast('Данные инспектора обновлены');
+        // Call backend update endpoint
+        let updatedInspectorData: Inspector | null = null;
+        try {
+          const res = await api.put(`/inspectors/${inspData.id}`, {
+            full_name: inspData.full_name,
+            rank: inspData.rank,
+            role: inspData.role,
+            phone: inspData.phone,
+            email: inspData.email
+          });
+          if (res.data) {
+            updatedInspectorData = sanitizeLegacyIds([res.data])[0];
+          }
+        } catch (apiErr) {
+          console.warn('Backend update failed or server offline, saving changes locally:', apiErr);
+        }
+
+        const merged: Inspector = updatedInspectorData || ({
+          ...inspectors.find((i) => i.id === inspData.id),
+          ...inspData
+        } as Inspector);
+
+        setInspectors((prev) => {
+          const updatedList = prev.map((i) => (i.id === inspData.id ? { ...i, ...merged } : i));
+          try {
+            localStorage.setItem('app_inspectors', JSON.stringify(updatedList));
+            localStorage.setItem('inspectors_registry', JSON.stringify(updatedList));
+          } catch {}
+          return updatedList;
+        });
+
+        // If the edited inspector is the currently logged-in user, update session
+        if (currentUser && (currentUser.id === inspData.id || String(currentUser.id) === String(inspData.id))) {
+          const updatedUser: Inspector = {
+            ...currentUser,
+            ...merged
+          };
+          setCurrentUser(updatedUser);
+          try {
+            localStorage.setItem('current_user', JSON.stringify(updatedUser));
+            localStorage.setItem('app_current_user', JSON.stringify(updatedUser));
+          } catch {}
+        }
+
+        // Record audit log
+        try {
+          const entry = createAuditEntry(
+            currentUser,
+            'Изменение сотрудника',
+            merged.full_name || `Инспектор #${inspData.id}`,
+            `Изменены данные: звание «${merged.rank}», роль «${merged.role}», email «${merged.email}»`
+          );
+          setAuditLogs((prev) => [entry, ...prev]);
+        } catch (auditErr) {
+          console.error('Failed to create audit log for inspector edit:', auditErr);
+        }
+
+        showToast('Данные инспектора успешно обновлены');
       } else {
         const nextId = getNextSequentialId(inspectors);
         const newInsp: Inspector = {
@@ -4372,10 +4570,35 @@ export default function App() {
             admin_code: newInsp.role === 'Администратор' ? 'ADMIN2026' : undefined
           });
           const created = res.data ? sanitizeLegacyIds([res.data])[0] : newInsp;
-          setInspectors((prev) => [...prev.filter((x) => x.id !== created.id && x.email !== created.email), created]);
+          setInspectors((prev) => {
+            const updated = [...prev.filter((x) => x.id !== created.id && x.email !== created.email), created];
+            try {
+              localStorage.setItem('app_inspectors', JSON.stringify(updated));
+              localStorage.setItem('inspectors_registry', JSON.stringify(updated));
+            } catch {}
+            return updated;
+          });
         } catch {
-          setInspectors((prev) => [...prev, newInsp]);
+          setInspectors((prev) => {
+            const updated = [...prev, newInsp];
+            try {
+              localStorage.setItem('app_inspectors', JSON.stringify(updated));
+              localStorage.setItem('inspectors_registry', JSON.stringify(updated));
+            } catch {}
+            return updated;
+          });
         }
+
+        try {
+          const entry = createAuditEntry(
+            currentUser,
+            'Регистрация сотрудника',
+            newInsp.full_name,
+            `Внесен в реестр: звание «${newInsp.rank}», роль «${newInsp.role}»`
+          );
+          setAuditLogs((prev) => [entry, ...prev]);
+        } catch {}
+
         showToast('Инспектор добавлен в реестр');
       }
     } catch {
