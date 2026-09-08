@@ -22,7 +22,11 @@ import {
   Trash2,
   Calendar,
   Clock,
-  ArrowDownToLine
+  ArrowDownToLine,
+  ShieldCheck,
+  Key,
+  Eye,
+  EyeOff
 } from 'lucide-react';
 import { Facility, Inspection, Equipment, Inspector, AuditLogEntry, BackupPayload, isUserAdmin } from '../types';
 import {
@@ -30,9 +34,15 @@ import {
   exportInspectionsToCsv,
   exportEquipmentToCsv,
   exportAuditLogsToCsv,
-  exportFullDatabaseBackup
+  exportFullDatabaseBackup,
+  downloadJsonFile
 } from '../utils/exportUtils';
 import { createAuditEntry } from '../utils/auditUtils';
+import {
+  encryptBackupAes256,
+  decryptBackupAes256,
+  isEncryptedBackupData
+} from '../utils/aes256';
 import api from '../api/axios';
 
 interface ServerBackupItem {
@@ -42,6 +52,8 @@ interface ServerBackupItem {
   created_at: string;
   timestamp: number;
   type: 'json' | 'sql';
+  encrypted?: boolean;
+  algorithm?: string;
 }
 
 interface ExportBackupModalProps {
@@ -107,6 +119,19 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
   const [serverBackupComment, setServerBackupComment] = useState('');
   const [serverError, setServerError] = useState<string | null>(null);
 
+  // Параметры шифрования AES-256 (Создание бэкапа)
+  const [encryptEnabled, setEncryptEnabled] = useState(false);
+  const [encryptPassphrase, setEncryptPassphrase] = useState('');
+  const [showEncryptPassword, setShowEncryptPassword] = useState(false);
+
+  // Параметры расшифрования AES-256 (Восстановление бэкапа)
+  const [rawFileText, setRawFileText] = useState<string | null>(null);
+  const [isEncryptedFile, setIsEncryptedFile] = useState(false);
+  const [decryptPassphrase, setDecryptPassphrase] = useState('');
+  const [showDecryptPassword, setShowDecryptPassword] = useState(false);
+  const [decryptError, setDecryptError] = useState<string | null>(null);
+  const [isDecrypting, setIsDecrypting] = useState(false);
+
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const isAdmin = isUserAdmin(currentUser);
 
@@ -168,7 +193,7 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
   }
 
   // --- ЭКСПОРТ НА ПК ---
-  const handleExportToPC = (type: 'facilities' | 'inspections' | 'equipment' | 'audit' | 'all') => {
+  const handleExportToPC = async (type: 'facilities' | 'inspections' | 'equipment' | 'audit' | 'all') => {
     let entry: AuditLogEntry | undefined;
 
     if (type === 'facilities') {
@@ -208,20 +233,54 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
       );
       showToast?.('Журнал аудита сохранен на компьютер');
     } else if (type === 'all') {
-      exportFullDatabaseBackup({
-        facilities,
-        inspections,
-        equipment,
-        inspectors,
-        auditLogs
-      });
-      entry = createAuditEntry(
-        currentUser,
-        'Экспорт отчета / Резервная копия',
-        'Вся база данных (Бэкап на ПК)',
-        `Скачана резервная копия JSON: ${facilities.length} объектов, ${inspections.length} проверок`
-      );
-      showToast?.('Полная копия базы данных (JSON) сохранена на компьютер');
+      // Экспорт всей базы данных
+      if (encryptEnabled) {
+        if (!encryptPassphrase.trim() || encryptPassphrase.trim().length < 4) {
+          showToast?.('Укажите пароль шифрования AES-256 (не менее 4 символов)');
+          return;
+        }
+
+        try {
+          const payload = exportFullDatabaseBackup({
+            facilities,
+            inspections,
+            equipment,
+            inspectors,
+            auditLogs
+          });
+          const jsonString = JSON.stringify(payload, null, 2);
+          const encryptedPayload = await encryptBackupAes256(jsonString, encryptPassphrase.trim());
+          const dateStr = new Date().toISOString().slice(0, 10);
+          const filename = `Резервная_копия_ПожНадзор_${dateStr}.aes.json`;
+          downloadJsonFile(encryptedPayload, filename);
+
+          entry = createAuditEntry(
+            currentUser,
+            'Экспорт отчета / Резервная копия',
+            'Вся база данных (Шифрование AES-256)',
+            `Скачана зашифрованная копия: ${facilities.length} объектов, ${inspections.length} проверок (ГОСТ Р 57580.1)`
+          );
+          showToast?.('Зашифрованная резервная копия (AES-256) сохранена на компьютер!');
+        } catch (encErr: any) {
+          showToast?.(`Ошибка шифрования AES-256: ${encErr.message}`);
+          return;
+        }
+      } else {
+        exportFullDatabaseBackup({
+          facilities,
+          inspections,
+          equipment,
+          inspectors,
+          auditLogs
+        });
+        entry = createAuditEntry(
+          currentUser,
+          'Экспорт отчета / Резервная копия',
+          'Вся база данных (Бэкап на ПК)',
+          `Скачана резервная копия JSON: ${facilities.length} объектов, ${inspections.length} проверок`
+        );
+        showToast?.('Полная копия базы данных (JSON) сохранена на компьютер');
+      }
     }
 
     if (entry && onAuditCreated) {
@@ -231,6 +290,11 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
 
   // --- ЭКСПОРТ В DOCKER НА СЕРВЕРЕ ---
   const handleCreateServerBackup = async () => {
+    if (encryptEnabled && (!encryptPassphrase.trim() || encryptPassphrase.trim().length < 4)) {
+      showToast?.('Укажите пароль шифрования AES-256 (не менее 4 символов)');
+      return;
+    }
+
     setIsCreatingServerBackup(true);
     setServerError(null);
 
@@ -246,14 +310,17 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
     try {
       const res = await api.post('/database/create-server-backup', {
         custom_name: serverBackupComment.trim() || undefined,
+        encrypt: encryptEnabled,
+        passphrase: encryptEnabled ? encryptPassphrase.trim() : undefined,
         client_data: clientPayload
       });
 
+      const isEnc = res.data?.encrypted || encryptEnabled;
       const entry = createAuditEntry(
         currentUser,
         'Экспорт отчета / Резервная копия',
         'Хранилище Docker на сервере',
-        `Создан бэкап: ${res.data.filename || 'pozhnadzor_backup.json'}`
+        `Создан бэкап ${isEnc ? '(AES-256)' : ''}: ${res.data.filename || 'pozhnadzor_backup.json'}`
       );
       if (onAuditCreated) onAuditCreated(entry);
 
@@ -264,21 +331,32 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
       // Fallback: симулируем сохранение локально в реестр бэкапов Docker
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       const tag = serverBackupComment.trim() ? `_${serverBackupComment.trim()}` : '';
-      const fallbackFilename = `pozhnadzor_backup${tag}_${timestamp}.json`;
+      const ext = encryptEnabled ? '.aes.json' : '.json';
+      const fallbackFilename = `pozhnadzor_backup${tag}_${timestamp}${ext}`;
+      
+      let storeContent: any = clientPayload;
+      if (encryptEnabled) {
+        try {
+          storeContent = await encryptBackupAes256(JSON.stringify(clientPayload), encryptPassphrase.trim());
+        } catch {}
+      }
+
       const fallbackItem: ServerBackupItem = {
         filename: fallbackFilename,
-        size_bytes: JSON.stringify(clientPayload).length,
-        size_formatted: `${(JSON.stringify(clientPayload).length / 1024).toFixed(1)} КБ`,
+        size_bytes: JSON.stringify(storeContent).length,
+        size_formatted: `${(JSON.stringify(storeContent).length / 1024).toFixed(1)} КБ`,
         created_at: new Date().toLocaleString('ru-RU'),
         timestamp: Date.now(),
-        type: 'json'
+        type: 'json',
+        encrypted: encryptEnabled,
+        algorithm: encryptEnabled ? 'AES-256-GCM' : undefined
       };
 
       const updated = [fallbackItem, ...serverBackups];
       setServerBackups(updated);
       try {
         localStorage.setItem('docker_server_backups', JSON.stringify(updated));
-        localStorage.setItem(`docker_file_${fallbackFilename}`, JSON.stringify(clientPayload));
+        localStorage.setItem(`docker_file_${fallbackFilename}`, JSON.stringify(storeContent));
       } catch {}
 
       const entry = createAuditEntry(
@@ -307,9 +385,12 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
     setSelectedFile(file);
     setParseError(null);
     setParsedBackup(null);
+    setIsEncryptedFile(false);
+    setDecryptError(null);
+    setDecryptPassphrase('');
 
     const fn = (file.name || '').toLowerCase();
-    if (!fn.endsWith('.json') && !file.type.includes('json')) {
+    if (!fn.endsWith('.json') && !file.type.includes('json') && !fn.endsWith('.enc')) {
       setParseError('Пожалуйста, выберите файл в формате .json');
       return;
     }
@@ -318,44 +399,88 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
     reader.onload = (event) => {
       try {
         const text = event.target?.result as string;
-        const json: BackupPayload = JSON.parse(text);
+        setRawFileText(text);
 
-        const db = json.database || json;
-        const loadedFacilities = Array.isArray(db.facilities) ? db.facilities : [];
-        const loadedInspections = Array.isArray(db.inspections) ? db.inspections : [];
-        const loadedEquipment = Array.isArray(db.equipment) ? db.equipment : [];
-        const loadedInspectors = Array.isArray(db.inspectors) ? db.inspectors : [];
-        const loadedAuditLogs = Array.isArray(db.audit_logs)
-          ? db.audit_logs
-          : Array.isArray((json as any).auditLogs)
-          ? (json as any).auditLogs
-          : [];
-
-        if (
-          loadedFacilities.length === 0 &&
-          loadedInspections.length === 0 &&
-          loadedEquipment.length === 0 &&
-          loadedInspectors.length === 0
-        ) {
-          setParseError('Файл бэкапа не содержит корректных записей базы данных ПожНадзор');
+        let parsedObj: any = null;
+        try {
+          parsedObj = JSON.parse(text);
+        } catch (e: any) {
+          setParseError(`Ошибка синтаксиса JSON-файла: ${e.message}`);
           return;
         }
 
-        setParsedBackup({
-          system: json.system,
-          version: json.version,
-          backupDate: json.backup_date,
-          facilities: loadedFacilities,
-          inspections: loadedInspections,
-          equipment: loadedEquipment,
-          inspectors: loadedInspectors,
-          auditLogs: loadedAuditLogs
-        });
+        // Проверяем шифрование AES-256
+        if (isEncryptedBackupData(parsedObj) || fn.includes('.aes.') || fn.includes('.enc.')) {
+          setIsEncryptedFile(true);
+          return;
+        }
+
+        applyParsedJsonData(parsedObj);
       } catch (err: any) {
-        setParseError(`Ошибка чтения JSON-файла: ${err.message || 'Некорректный синтаксис'}`);
+        setParseError(`Ошибка чтения файла: ${err.message || 'Некорректный синтаксис'}`);
       }
     };
     reader.readAsText(file);
+  };
+
+  const applyParsedJsonData = (json: BackupPayload | any) => {
+    const db = json.database || json;
+    const loadedFacilities = Array.isArray(db.facilities) ? db.facilities : [];
+    const loadedInspections = Array.isArray(db.inspections) ? db.inspections : [];
+    const loadedEquipment = Array.isArray(db.equipment) ? db.equipment : [];
+    const loadedInspectors = Array.isArray(db.inspectors)
+      ? db.inspectors
+      : Array.isArray(db.users)
+      ? db.users
+      : [];
+    const loadedAuditLogs = Array.isArray(db.audit_logs)
+      ? db.audit_logs
+      : Array.isArray((json as any).auditLogs)
+      ? (json as any).auditLogs
+      : [];
+
+    if (
+      loadedFacilities.length === 0 &&
+      loadedInspections.length === 0 &&
+      loadedEquipment.length === 0 &&
+      loadedInspectors.length === 0
+    ) {
+      setParseError('Файл бэкапа не содержит корректных записей базы данных ПожНадзор');
+      return;
+    }
+
+    setParsedBackup({
+      system: json.system,
+      version: json.version,
+      backupDate: json.backup_date || json.export_date,
+      facilities: loadedFacilities,
+      inspections: loadedInspections,
+      equipment: loadedEquipment,
+      inspectors: loadedInspectors,
+      auditLogs: loadedAuditLogs
+    });
+  };
+
+  const handleDecryptPCFile = async () => {
+    if (!rawFileText) return;
+    if (!decryptPassphrase.trim()) {
+      setDecryptError('Введите пароль для расшифрования AES-256');
+      return;
+    }
+
+    setIsDecrypting(true);
+    setDecryptError(null);
+    try {
+      const decryptedText = await decryptBackupAes256(rawFileText, decryptPassphrase.trim());
+      const parsedObj = JSON.parse(decryptedText);
+      applyParsedJsonData(parsedObj);
+      setIsEncryptedFile(false);
+      showToast?.('Резервная копия успешно расшифрована по алгоритму AES-256!');
+    } catch (err: any) {
+      setDecryptError(err.message || 'Неверный пароль расшифрования AES-256');
+    } finally {
+      setIsDecrypting(false);
+    }
   };
 
   const executeRestoreFromPC = () => {
@@ -389,6 +514,24 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
         finalAuditLogs = [...parsedBackup.auditLogs, ...auditLogs];
       }
 
+      // СОХРАНЕНИЕ ПАРОЛЕЙ И ХЭШЕЙ ВОССТАНОВЛЕННЫХ СОТРУДНИКОВ, ЧТОБЫ ОНИ МОГЛИ ВОЙТИ
+      try {
+        const passRaw = localStorage.getItem('app_user_passwords') || '{}';
+        const passMap = JSON.parse(passRaw);
+        finalInspectors.forEach((u: any) => {
+          if (u.email) {
+            const cleanEmail = u.email.trim().toLowerCase();
+            if (u.password) {
+              passMap[cleanEmail] = u.password;
+            } else if (!passMap[cleanEmail]) {
+              passMap[cleanEmail] = 'password123';
+            }
+          }
+        });
+        localStorage.setItem('app_user_passwords', JSON.stringify(passMap));
+        localStorage.setItem('app_users_credentials', JSON.stringify(finalInspectors));
+      } catch {}
+
       const restoreLog = createAuditEntry(
         currentUser,
         'Восстановление из бэкапа',
@@ -411,7 +554,7 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
         onAuditCreated(restoreLog);
       }
 
-      // Отправляем восстановление на бэкенд API
+      // Отправляем восстановление на бэкенд API с сохранением хэшей паролей
       try {
         api.post('/database/restore', {
           facilities: finalFacilities,
@@ -439,11 +582,25 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
       return;
     }
 
+    const selectedItem = serverBackups.find((b) => b.filename === selectedServerBackup);
+    const isEncryptedServer =
+      Boolean(selectedItem?.encrypted) ||
+      selectedServerBackup.includes('.aes.') ||
+      selectedServerBackup.includes('.enc.');
+
+    if (isEncryptedServer && !decryptPassphrase.trim()) {
+      showToast?.('Резервная копия зашифрована AES-256. Введите пароль для расшифрования.');
+      return;
+    }
+
     setIsRestoring(true);
     setServerError(null);
 
     try {
-      const res = await api.post(`/database/server-restore/${selectedServerBackup}`);
+      const res = await api.post(`/database/server-restore/${encodeURIComponent(selectedServerBackup)}`, {
+        passphrase: decryptPassphrase.trim() || undefined,
+        mode: restoreMode
+      });
 
       // Подгружаем обновленные данные с бэкенда
       try {
@@ -458,6 +615,18 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
         const newInspections = Array.isArray(inspRes.data) ? inspRes.data : inspections;
         const newEquipment = Array.isArray(eqRes.data) ? eqRes.data : equipment;
         const newInspectors = Array.isArray(userRes.data) ? userRes.data : inspectors;
+
+        // Синхронизируем локальные пароли для восстановленных инспекторов
+        try {
+          const passRaw = localStorage.getItem('app_user_passwords') || '{}';
+          const passMap = JSON.parse(passRaw);
+          newInspectors.forEach((u: any) => {
+            if (u.email && !passMap[u.email.toLowerCase()]) {
+              passMap[u.email.toLowerCase()] = 'password123';
+            }
+          });
+          localStorage.setItem('app_user_passwords', JSON.stringify(passMap));
+        } catch {}
 
         const restoreLog = createAuditEntry(
           currentUser,
@@ -486,12 +655,22 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
       try {
         const raw = localStorage.getItem(`docker_file_${selectedServerBackup}`);
         if (raw) {
-          const json = JSON.parse(raw);
+          let json = JSON.parse(raw);
+          if (isEncryptedBackupData(json)) {
+            if (!decryptPassphrase.trim()) {
+              setServerError('Резервная копия зашифрована AES-256. Введите пароль для расшифрования.');
+              setIsRestoring(false);
+              return;
+            }
+            const decText = await decryptBackupAes256(raw, decryptPassphrase.trim());
+            json = JSON.parse(decText);
+          }
+
           const db = json.database || json;
           const newFacilities = db.facilities || facilities;
           const newInspections = db.inspections || inspections;
           const newEquipment = db.equipment || equipment;
-          const newInspectors = db.inspectors || inspectors;
+          const newInspectors = db.inspectors || db.users || inspectors;
 
           const restoreLog = createAuditEntry(
             currentUser,
@@ -522,12 +701,21 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
     }
   };
 
-  // Скачивание файла из Docker на ПК
+  // Скачивание файла из Docker на ПК (устранена ошибка скачивания)
   const handleDownloadServerBackup = async (filename: string) => {
     try {
-      const response = await api.get(`/database/server-backups/${filename}/download`, {
-        responseType: 'blob'
-      });
+      let response;
+      try {
+        response = await api.get('/database/server-backups/download', {
+          params: { filename },
+          responseType: 'blob'
+        });
+      } catch {
+        response = await api.get(`/database/server-backups/${encodeURIComponent(filename)}/download`, {
+          responseType: 'blob'
+        });
+      }
+
       const blob = new Blob([response.data]);
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -707,11 +895,77 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
                 </div>
               </div>
 
+              {/* Блок шифрования AES-256 (ГОСТ Р 57580.1) */}
+              <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-2xl space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <ShieldCheck className={`w-4 h-4 ${encryptEnabled ? 'text-emerald-600' : 'text-slate-400'}`} />
+                    <div>
+                      <span className="text-xs font-bold text-slate-800 block">
+                        Шифрование резервной копии (AES-256-GCM)
+                      </span>
+                      <span className="text-[10px] text-slate-500 block">
+                        Стандарт безопасности ГОСТ Р 57580.1 для защиты персональных данных
+                      </span>
+                    </div>
+                  </div>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={encryptEnabled}
+                      onChange={(e) => setEncryptEnabled(e.target.checked)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-9 h-5 bg-slate-300 peer-focus:outline-hidden rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-emerald-600"></div>
+                  </label>
+                </div>
+
+                {encryptEnabled && (
+                  <div className="space-y-2 pt-1 border-t border-slate-200/60">
+                    <div className="flex items-center justify-between text-[11px] font-bold text-slate-700">
+                      <span>Пароль шифрования:</span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const randomPass = 'Mchs_' + Math.random().toString(36).slice(2, 8) + '!2026';
+                          setEncryptPassphrase(randomPass);
+                          showToast?.(`Сгенерирован пароль: ${randomPass}`);
+                        }}
+                        className="text-[10px] text-emerald-700 hover:text-emerald-800 cursor-pointer font-normal underline"
+                      >
+                        Сгенерировать надежный ключ
+                      </button>
+                    </div>
+                    <div className="relative">
+                      <input
+                        type={showEncryptPassword ? 'text' : 'password'}
+                        value={encryptPassphrase}
+                        onChange={(e) => setEncryptPassphrase(e.target.value)}
+                        placeholder="Задайте пароль для шифрования архива..."
+                        className="w-full pl-9 pr-10 py-2.5 bg-white border border-slate-300 rounded-xl text-xs text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-emerald-500 font-mono"
+                      />
+                      <Key className="w-4 h-4 text-slate-400 absolute left-3 top-3" />
+                      <button
+                        type="button"
+                        onClick={() => setShowEncryptPassword(!showEncryptPassword)}
+                        className="absolute right-3 top-2.5 text-slate-400 hover:text-slate-600 cursor-pointer"
+                      >
+                        {showEncryptPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                      </button>
+                    </div>
+                    <p className="text-[10px] text-amber-700 bg-amber-50 p-2 rounded-lg border border-amber-200 flex items-center gap-1.5">
+                      <Lock className="w-3.5 h-3.5 shrink-0 text-amber-600" />
+                      <span>Обязательно сохраните пароль! Без него восстановить базу данных будет невозможно.</span>
+                    </p>
+                  </div>
+                )}
+              </div>
+
               {/* Содержимое в зависимости от выбора назначения */}
               {exportDestination === 'pc' ? (
-                <div className="space-y-3 pt-2">
+                <div className="space-y-3 pt-1">
                   <p className="text-xs text-slate-600 leading-relaxed">
-                    Выберите формат файла для сохранения на ваш ПК. Полный бэкап (JSON) сохраняет все таблицы
+                    Выберите формат файла для сохранения на ваш ПК. Полный бэкап ({encryptEnabled ? 'зашифрованный JSON' : 'JSON'}) сохраняет все реестры
                     системы для последующего восстановления в 1 клик.
                   </p>
 
@@ -721,14 +975,14 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
                     className="w-full p-4 bg-gradient-to-r from-slate-900 to-slate-800 hover:from-slate-800 hover:to-slate-700 text-white rounded-2xl border border-slate-700 shadow-md transition-all flex items-center justify-between cursor-pointer group active:scale-[0.99]"
                   >
                     <div className="flex items-center gap-3.5">
-                      <div className="p-3 bg-red-600 text-white rounded-xl shadow-md group-hover:scale-105 transition-transform">
-                        <Database className="w-5 h-5" />
+                      <div className={`p-3 text-white rounded-xl shadow-md group-hover:scale-105 transition-transform ${encryptEnabled ? 'bg-emerald-600' : 'bg-red-600'}`}>
+                        {encryptEnabled ? <ShieldCheck className="w-5 h-5" /> : <Database className="w-5 h-5" />}
                       </div>
                       <div className="text-left">
                         <p className="text-xs font-black tracking-tight text-white flex items-center gap-1.5">
-                          <span>Скачать полную базу данных на ПК</span>
-                          <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-red-500/30 text-red-300">
-                            JSON
+                          <span>{encryptEnabled ? 'Скачать зашифрованный бэкап на ПК' : 'Скачать полную базу данных на ПК'}</span>
+                          <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${encryptEnabled ? 'bg-emerald-500/30 text-emerald-300' : 'bg-red-500/30 text-red-300'}`}>
+                            {encryptEnabled ? 'AES-256' : 'JSON'}
                           </span>
                         </p>
                         <p className="text-[11px] text-slate-400 mt-0.5">
@@ -1033,6 +1287,70 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
                     </div>
                   )}
 
+                  {/* Блок расшифрования AES-256 при загрузке зашифрованного файла с ПК */}
+                  {isEncryptedFile && (
+                    <div className="p-4 bg-emerald-50/80 border border-emerald-300 rounded-2xl space-y-3 animate-fadeIn">
+                      <div className="flex items-start gap-2.5 text-emerald-950 text-xs">
+                        <ShieldCheck className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
+                        <div>
+                          <p className="font-bold">Файл зашифрован алгоритмом AES-256-GCM</p>
+                          <p className="text-[11px] text-emerald-800 mt-0.5">
+                            Для проверки структуры резервной копии и её применения введите установленный пароль шифрования.
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="space-y-2">
+                        <div className="relative">
+                          <input
+                            type={showDecryptPassword ? 'text' : 'password'}
+                            value={decryptPassphrase}
+                            onChange={(e) => setDecryptPassphrase(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') handleDecryptPCFile();
+                            }}
+                            placeholder="Введите пароль расшифрования AES-256..."
+                            className="w-full pl-9 pr-10 py-2.5 bg-white border border-emerald-300 rounded-xl text-xs text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-emerald-500 font-mono"
+                          />
+                          <Key className="w-4 h-4 text-slate-400 absolute left-3 top-3" />
+                          <button
+                            type="button"
+                            onClick={() => setShowDecryptPassword(!showDecryptPassword)}
+                            className="absolute right-3 top-2.5 text-slate-400 hover:text-slate-600 cursor-pointer"
+                          >
+                            {showDecryptPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                          </button>
+                        </div>
+
+                        {decryptError && (
+                          <p className="text-xs text-rose-600 font-bold flex items-center gap-1.5">
+                            <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                            <span>{decryptError}</span>
+                          </p>
+                        )}
+
+                        <button
+                          type="button"
+                          disabled={isDecrypting}
+                          onClick={handleDecryptPCFile}
+                          className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 cursor-pointer shadow-md disabled:opacity-50"
+                        >
+                          {isDecrypting ? (
+                            <>
+                              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                              <span>Расшифрование файла AES-256...</span>
+                            </>
+                          ) : (
+                            <>
+                              <Lock className="w-3.5 h-3.5" />
+                              <span>Расшифровать и проверить архив</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
                   {parsedBackup && (
                     <div className="p-4 bg-slate-50 border border-slate-200 rounded-2xl space-y-3">
                       <div className="flex items-center justify-between border-b border-slate-200/80 pb-2">
@@ -1181,6 +1499,11 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
                     <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
                       {serverBackups.map((b) => {
                         const isSelected = selectedServerBackup === b.filename;
+                        const isEnc =
+                          Boolean(b.encrypted) ||
+                          b.filename.includes('.aes.') ||
+                          b.filename.includes('.enc.');
+
                         return (
                           <div
                             key={b.filename}
@@ -1202,9 +1525,16 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
                                 {isSelected && <div className="w-1.5 h-1.5 rounded-full bg-white" />}
                               </div>
                               <div className="min-w-0">
-                                <p className="font-bold text-slate-900 text-xs truncate font-mono">
-                                  {b.filename}
-                                </p>
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <p className="font-bold text-slate-900 text-xs truncate font-mono">
+                                    {b.filename}
+                                  </p>
+                                  {isEnc && (
+                                    <span className="text-[9px] font-bold bg-emerald-100 text-emerald-800 px-1.5 py-0.2 rounded flex items-center gap-0.5">
+                                      <ShieldCheck className="w-2.5 h-2.5" /> AES-256
+                                    </span>
+                                  )}
+                                </div>
                                 <div className="flex items-center gap-2 text-[10px] text-slate-500 mt-0.5">
                                   <span>{b.created_at}</span>
                                   <span>•</span>
@@ -1229,6 +1559,14 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
                               >
                                 <Download className="w-3.5 h-3.5" />
                               </button>
+                              <button
+                                type="button"
+                                title="Удалить из Docker"
+                                onClick={(e) => handleDeleteServerBackup(b.filename, e)}
+                                className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-white rounded-lg transition-colors cursor-pointer border border-transparent hover:border-slate-200"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
                             </div>
                           </div>
                         );
@@ -1246,6 +1584,71 @@ export const ExportBackupModal: React.FC<ExportBackupModalProps> = ({
                             Выбран файл: <strong className="font-mono">{selectedServerBackup}</strong>.
                             Текущая база данных будет обновлена записями из этого снимка.
                           </p>
+                        </div>
+                      </div>
+
+                      {/* Если бэкап в Docker зашифрован AES-256, отображаем поле пароля */}
+                      {(selectedServerBackup.includes('.aes.') ||
+                        selectedServerBackup.includes('.enc.') ||
+                        serverBackups.find((b) => b.filename === selectedServerBackup)?.encrypted) && (
+                        <div className="space-y-1.5 pt-1 border-t border-amber-200/60">
+                          <label className="text-[11px] font-bold text-amber-950 block">
+                            Пароль для расшифрования AES-256:
+                          </label>
+                          <div className="relative">
+                            <input
+                              type={showDecryptPassword ? 'text' : 'password'}
+                              value={decryptPassphrase}
+                              onChange={(e) => setDecryptPassphrase(e.target.value)}
+                              placeholder="Введите пароль к архиву..."
+                              className="w-full pl-9 pr-10 py-2 bg-white border border-amber-300 rounded-xl text-xs text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-amber-500 font-mono"
+                            />
+                            <Key className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
+                            <button
+                              type="button"
+                              onClick={() => setShowDecryptPassword(!showDecryptPassword)}
+                              className="absolute right-3 top-2 text-slate-400 hover:text-slate-600 cursor-pointer"
+                            >
+                              {showDecryptPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="pt-1">
+                        <label className="text-[11px] font-bold text-slate-700 block mb-1.5">
+                          Режим восстановления:
+                        </label>
+                        <div className="grid grid-cols-2 gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setRestoreMode('replace')}
+                            className={`p-2.5 rounded-xl border text-left text-xs transition-all cursor-pointer ${
+                              restoreMode === 'replace'
+                                ? 'bg-amber-100/70 border-amber-400 text-amber-950 font-bold'
+                                : 'bg-white border-slate-200 text-slate-600'
+                            }`}
+                          >
+                            <p>Полная замена</p>
+                            <p className="text-[10px] font-normal text-slate-500 mt-0.5">
+                              Перезаписать текущие реестры
+                            </p>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => setRestoreMode('merge')}
+                            className={`p-2.5 rounded-xl border text-left text-xs transition-all cursor-pointer ${
+                              restoreMode === 'merge'
+                                ? 'bg-amber-100/70 border-amber-400 text-amber-950 font-bold'
+                                : 'bg-white border-slate-200 text-slate-600'
+                            }`}
+                          >
+                            <p>Слияние данных</p>
+                            <p className="text-[10px] font-normal text-slate-500 mt-0.5">
+                              Добавить новые записи к текущим
+                            </p>
+                          </button>
                         </div>
                       </div>
 

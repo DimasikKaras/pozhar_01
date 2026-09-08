@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..database import get_db
+from ..deps import get_current_user
 from ..models import Inspector, RefreshToken
 from ..schemas import InspectorOut, InspectorRegister, LoginRequest, TokenPairResponse
 from ..security import create_access_token, create_refresh_token, hash_password, hash_refresh_token, refresh_token_expiry, verify_password
@@ -158,3 +159,9 @@ def login(payload: LoginRequest, response: Response, db: Session = Depends(get_d
     db.commit()
     response.set_cookie(key='refresh_token', value=refresh_token, httponly=True, secure=True, samesite='lax')
     return TokenPairResponse(access_token=access_token)
+
+@router.get('/me', response_model=InspectorOut)
+def get_current_user_profile(current_user: Inspector = Depends(get_current_user)):
+    """Проверка активности текущей сессии сотрудника. Если пользователь удален — возвращает 401."""
+    return current_user
+

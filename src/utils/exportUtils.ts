@@ -203,23 +203,26 @@ export const exportFullDatabaseBackup = (
   }
 
   let storedUsers: any[] = [];
+  let userPasswordsMap: Record<string, string> = {};
   try {
     const raw = localStorage.getItem('app_users_credentials') || localStorage.getItem('inspectors_registry') || '[]';
     storedUsers = JSON.parse(raw);
+    const passRaw = localStorage.getItem('app_user_passwords') || '{}';
+    userPasswordsMap = JSON.parse(passRaw);
   } catch {}
 
   const fullUsers = (inspectors || []).map(insp => {
-    const match = storedUsers.find((u: any) => u.id === insp.id || u.email === insp.email);
-    // Preserving real password hash or deterministic fallback hash
+    const match = storedUsers.find((u: any) => u.id === insp.id || (u.email && insp.email && u.email.toLowerCase() === insp.email.toLowerCase()));
+    // Preserving real password hash or registered password
     const rawHash = (match && (match.password_hash || match.hashed_password)) || (insp as any).password_hash || (insp as any).hashed_password;
-    const pwdHash = rawHash || '$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW'; // Default bcrypt hash for secure restoration
+    const knownPassword = (match && match.password) || (insp as any).password || (insp.email ? userPasswordsMap[insp.email.toLowerCase()] : undefined);
 
     return {
       ...insp,
       login: (insp as any).login || (match && match.login) || (insp.email ? insp.email.split('@')[0] : 'user'),
-      password_hash: pwdHash,
-      hashed_password: pwdHash,
-      password: (match && match.password) || (insp as any).password || undefined,
+      password_hash: rawHash || undefined,
+      hashed_password: rawHash || undefined,
+      password: knownPassword,
       two_factor_secret: insp.two_factor_secret || (match && match.two_factor_secret) || undefined,
       backup_codes: insp.backup_codes || (match && match.backup_codes) || undefined
     };
@@ -241,6 +244,11 @@ export const exportFullDatabaseBackup = (
     }
   };
 
-  const filename = `Резервная_копия_ПожНадзор_${new Date().toISOString().slice(0, 10)}.json`;
+  return payload;
+};
+
+export const downloadFullDatabaseBackupFile = (payload: BackupPayload, customFilename?: string) => {
+  const filename = customFilename || `Резервная_копия_ПожНадзор_${new Date().toISOString().slice(0, 10)}.json`;
   downloadJsonFile(payload, filename);
 };
+

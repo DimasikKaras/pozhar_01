@@ -3,10 +3,12 @@ import json
 import subprocess
 from datetime import datetime, date
 from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from urllib.parse import quote, unquote
+
+from fastapi import APIRouter, Depends, HTTPException, Response, Query, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import select, delete
 
 from ..database import get_db
 from ..deps import get_current_user, require_roles
@@ -21,6 +23,11 @@ from ..models import (
     InspectionResultEnum
 )
 from ..security import hash_password
+from ..utils.crypto import (
+    encrypt_data_aes256,
+    decrypt_data_aes256,
+    is_aes256_encrypted
+)
 
 router = APIRouter(prefix="/database", tags=["database"])
 
@@ -180,13 +187,19 @@ def build_full_backup_dict(db: Session) -> Dict[str, Any]:
     }
 
 
-def restore_data_from_dict(db_data: Dict[str, Any], db: Session) -> Dict[str, Any]:
+def restore_data_from_dict(db_data: Dict[str, Any], db: Session, mode: str = "replace") -> Dict[str, Any]:
+    """
+    Восстановление данных из словаря.
+    mode:
+      - 'replace': полная перезапись данных оборудования и проверок без задвоения записей;
+      - 'merge': слияние данных с обновлением совпадающих записей и предотвращением дубликатов.
+    """
     raw_inspectors = db_data.get("inspectors") or db_data.get("users") or []
     raw_facilities = db_data.get("facilities") or []
     raw_equipment = db_data.get("equipment") or []
     raw_inspections = db_data.get("inspections") or []
 
-    # 1. Восстановление сотрудников с хэшами паролей
+    # 1. Восстановление сотрудников с сохранением password_hash
     restored_users_count = 0
     inspector_id_map = {}
     for u in raw_inspectors:
@@ -195,26 +208,30 @@ def restore_data_from_dict(db_data: Dict[str, Any], db: Session) -> Dict[str, An
             continue
 
         role_str = str(u.get("role", "Инспектор")).strip().lower()
-        role_enum = RoleEnum.admin if "админ" in role_str or "admin" in role_str else RoleEnum.inspector
+        role_enum = RoleEnum.admin if ("админ" in role_str or "admin" in role_str) else RoleEnum.inspector
 
         existing_user = db.scalar(select(Inspector).where(Inspector.email == email))
-        pwd_hash = u.get("password_hash") or (hash_password(u.get("password")) if u.get("password") else None)
+        pwd_hash = u.get("password_hash") or u.get("hashed_password")
+        if not pwd_hash and u.get("password"):
+            pwd_hash = hash_password(u.get("password"))
 
         if existing_user:
             existing_user.full_name = u.get("full_name") or existing_user.full_name
             existing_user.rank = u.get("rank") or existing_user.rank
             existing_user.phone = u.get("phone") or existing_user.phone
             existing_user.role = role_enum
+            # Обновляем хэш пароля только если он явно присутствует в бэкапе
             if pwd_hash:
                 existing_user.password_hash = pwd_hash
             target_user = existing_user
         else:
+            # Сотрудник был удален или отсутствует в БД -> восстанавливаем с оригинальным хэшем!
             new_user = Inspector(
                 full_name=u.get("full_name", "Инспектор ГПН"),
                 rank=u.get("rank", "Сотрудник ГПН"),
                 phone=u.get("phone"),
                 email=email,
-                password_hash=pwd_hash or hash_password("Mchs2026!"),
+                password_hash=pwd_hash or hash_password(u.get("password") or "Mchs2026!"),
                 role=role_enum
             )
             db.add(new_user)
@@ -274,11 +291,20 @@ def restore_data_from_dict(db_data: Dict[str, Any], db: Session) -> Dict[str, An
         db.commit()
         db.refresh(fallback_fac)
 
-    # 3. Восстановление оборудования и СИЗ
+    # Опорный инспектор на случай отсутствия инспектора
+    fallback_insp = db.scalars(select(Inspector)).first()
+
+    # В РЕЖИМЕ REPLACE (полное восстановление) очищаем текущие проверки и оборудование,
+    # чтобы полностью исключить дублирование данных!
+    if mode == "replace":
+        db.execute(delete(Inspection))
+        db.execute(delete(Equipment))
+        db.commit()
+
+    # 3. Восстановление оборудования и СИЗ (с защитой от дублей)
     restored_eq_count = 0
     for e in raw_equipment:
         eq_name = e.get("name") or e.get("type") or "Оборудование ПБ"
-
         orig_fac_id = e.get("facility_id")
         mapped_fac_id = facility_id_map.get(orig_fac_id, orig_fac_id)
         if not mapped_fac_id or not db.get(Facility, mapped_fac_id):
@@ -290,26 +316,52 @@ def restore_data_from_dict(db_data: Dict[str, Any], db: Session) -> Dict[str, An
         st_val = parse_equipment_status(e.get("status"))
         last_check = parse_date_safe(e.get("last_check_date"))
         next_check = parse_date_safe(e.get("next_check_date")) if e.get("next_check_date") else None
+        serial_no = e.get("serial_number")
 
-        new_eq = Equipment(
-            facility_id=mapped_fac_id,
-            name=eq_name,
-            type=e.get("type", "Первичные средства пожаротушения"),
-            serial_number=e.get("serial_number"),
-            status=st_val,
-            last_check_date=last_check,
-            next_check_date=next_check,
-            notes=e.get("notes")
-        )
-        db.add(new_eq)
+        # Проверка на дубликат в режиме merge
+        existing_eq = None
+        if mode == "merge":
+            if serial_no:
+                existing_eq = db.scalar(
+                    select(Equipment).where(
+                        Equipment.facility_id == mapped_fac_id,
+                        Equipment.serial_number == serial_no
+                    )
+                )
+            if not existing_eq and e.get("id"):
+                existing_eq = db.get(Equipment, e["id"])
+            if not existing_eq:
+                existing_eq = db.scalar(
+                    select(Equipment).where(
+                        Equipment.facility_id == mapped_fac_id,
+                        Equipment.name == eq_name,
+                        Equipment.type == e.get("type", "Первичные средства пожаротушения")
+                    )
+                )
+
+        if existing_eq:
+            existing_eq.status = st_val
+            existing_eq.last_check_date = last_check
+            existing_eq.next_check_date = next_check
+            existing_eq.notes = e.get("notes", existing_eq.notes)
+        else:
+            new_eq = Equipment(
+                facility_id=mapped_fac_id,
+                name=eq_name,
+                type=e.get("type", "Первичные средства пожаротушения"),
+                serial_number=serial_no,
+                status=st_val,
+                last_check_date=last_check,
+                next_check_date=next_check,
+                notes=e.get("notes")
+            )
+            db.add(new_eq)
+
         restored_eq_count += 1
 
     db.commit()
 
-    # Опорный инспектор на случай несовпадения ID
-    fallback_insp = db.scalars(select(Inspector)).first()
-
-    # 4. Восстановление проверок
+    # 4. Восстановление проверок (с защитой от дублей)
     restored_insp_count = 0
     for ins in raw_inspections:
         orig_fac_id = ins.get("facility_id")
@@ -319,28 +371,51 @@ def restore_data_from_dict(db_data: Dict[str, Any], db: Session) -> Dict[str, An
 
         if not mapped_fac_id or not db.get(Facility, mapped_fac_id):
             mapped_fac_id = fallback_fac.id if fallback_fac else None
-
         if not mapped_fac_id:
             continue
 
         if not mapped_insp_id or not db.get(Inspector, mapped_insp_id):
             mapped_insp_id = fallback_insp.id if fallback_insp else None
-
         if not mapped_insp_id:
             continue
 
         res_val = parse_inspection_result(ins.get("result"))
         insp_date = parse_date_safe(ins.get("date"))
+        prescr = ins.get("prescription_number")
 
-        new_insp = Inspection(
-            facility_id=mapped_fac_id,
-            inspector_id=mapped_insp_id,
-            date=insp_date,
-            result=res_val,
-            prescription_number=ins.get("prescription_number"),
-            violations=ins.get("violations")
-        )
-        db.add(new_insp)
+        # Проверка на дубликат в режиме merge
+        existing_insp = None
+        if mode == "merge":
+            if prescr:
+                existing_insp = db.scalar(
+                    select(Inspection).where(Inspection.prescription_number == prescr)
+                )
+            if not existing_insp and ins.get("id"):
+                existing_insp = db.get(Inspection, ins["id"])
+            if not existing_insp:
+                existing_insp = db.scalar(
+                    select(Inspection).where(
+                        Inspection.facility_id == mapped_fac_id,
+                        Inspection.date == insp_date,
+                        Inspection.inspector_id == mapped_insp_id
+                    )
+                )
+
+        if existing_insp:
+            existing_insp.result = res_val
+            existing_insp.violations = ins.get("violations", existing_insp.violations)
+            existing_insp.prescription_number = prescr or existing_insp.prescription_number
+        else:
+            new_insp = Inspection(
+                facility_id=mapped_fac_id,
+                inspector_id=mapped_insp_id,
+                date=insp_date,
+                result=res_val,
+                prescription_number=prescr,
+                violations=ins.get("violations")
+            )
+            db.add(new_insp)
+
         restored_insp_count += 1
 
     db.commit()
@@ -348,6 +423,7 @@ def restore_data_from_dict(db_data: Dict[str, Any], db: Session) -> Dict[str, An
     return {
         "status": "ok",
         "message": "База данных успешно восстановлена",
+        "mode": mode,
         "restored_inspectors": restored_users_count,
         "restored_facilities": restored_fac_count,
         "restored_equipment": restored_eq_count,
@@ -361,23 +437,38 @@ def restore_data_from_dict(db_data: Dict[str, Any], db: Session) -> Dict[str, An
 
 @router.get("/backup")
 def export_database_backup(
+    encrypt: bool = Query(False, description="Зашифровать бэкап алгоритмом AES-256"),
+    passphrase: Optional[str] = Query(None, description="Пароль шифрования AES-256"),
     db: Session = Depends(get_db),
     current_user: Inspector = Depends(require_roles(RoleEnum.admin))
 ):
-    """Скачивание полной резервной копии базы данных на ПК администратора в формате JSON."""
+    """Скачивание полной резервной копии базы данных на ПК администратора (с поддержкой AES-256)."""
     try:
         backup_payload = build_full_backup_dict(db)
-        content = json.dumps(backup_payload, ensure_ascii=False, indent=2)
         date_str = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
-        filename = f"pozhnadzor_backup_{date_str}.json"
 
+        if encrypt:
+            if not passphrase or len(passphrase.strip()) < 4:
+                raise HTTPException(status_code=400, detail="Для шифрования AES-256 укажите пароль длиной не менее 4 символов")
+            raw_bytes = json.dumps(backup_payload, ensure_ascii=False, indent=2).encode("utf-8")
+            encrypted_payload = encrypt_data_aes256(raw_bytes, passphrase.strip())
+            content = json.dumps(encrypted_payload, ensure_ascii=False, indent=2).encode("utf-8")
+            filename = f"pozhnadzor_backup_{date_str}.enc.json"
+        else:
+            content = json.dumps(backup_payload, ensure_ascii=False, indent=2).encode("utf-8")
+            filename = f"pozhnadzor_backup_{date_str}.json"
+
+        safe_ascii_name = filename.encode("ascii", "ignore").decode("ascii") or "backup.json"
         return Response(
-            content=content.encode("utf-8"),
+            content=content,
             media_type="application/json; charset=utf-8",
             headers={
-                "Content-Disposition": f'attachment; filename="{filename}"'
+                "Content-Disposition": f'attachment; filename="{safe_ascii_name}"; filename*=UTF-8\'\'{quote(filename)}',
+                "Access-Control-Expose-Headers": "Content-Disposition"
             }
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка создания резервной копии: {str(e)}")
 
@@ -385,6 +476,8 @@ def export_database_backup(
 class CreateServerBackupRequest(BaseModel):
     custom_name: Optional[str] = None
     client_data: Optional[Dict[str, Any]] = None
+    encrypt: Optional[bool] = False
+    passphrase: Optional[str] = None
 
 
 @router.post("/create-server-backup")
@@ -397,18 +490,23 @@ def create_server_backup(
     try:
         os.makedirs(BACKUP_DIR, exist_ok=True)
         timestamp = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
-        
+
         custom_name = payload.custom_name.strip() if payload and payload.custom_name else None
+        safe_name = ""
         if custom_name:
-            # Очищаем имя от недопустимых символов
             safe_name = "".join(c for c in custom_name if c.isalnum() or c in ("-", "_", " ")).strip().replace(" ", "_")
-            filename = f"pozhnadzor_backup_{safe_name}_{timestamp}.json"
+
+        is_enc = bool(payload and payload.encrypt and payload.passphrase and payload.passphrase.strip())
+        ext = ".enc.json" if is_enc else ".json"
+
+        if safe_name:
+            filename = f"pozhnadzor_backup_{safe_name}_{timestamp}{ext}"
         else:
-            filename = f"pozhnadzor_backup_{timestamp}.json"
+            filename = f"pozhnadzor_backup_{timestamp}{ext}"
 
         filepath = os.path.join(BACKUP_DIR, filename)
 
-        # Если фронтенд передал актуальные локальные данные, используем их, иначе выгружаем из БД
+        # Выгрузка данных
         if payload and payload.client_data:
             backup_data = payload.client_data
             if "database" not in backup_data and ("facilities" in backup_data or "inspectors" in backup_data):
@@ -419,12 +517,29 @@ def create_server_backup(
                     "environment": "production-postgresql",
                     "database": payload.client_data
                 }
+
+            # ОБЯЗАТЕЛЬНО дополняем сотрудников реальными password_hash из базы данных PostgreSQL!
+            target_db_data = backup_data.get("database") if isinstance(backup_data.get("database"), dict) else backup_data
+            raw_users = target_db_data.get("inspectors") or target_db_data.get("users") or []
+            if raw_users:
+                db_users_map = {u.email.lower(): u.password_hash for u in db.scalars(select(Inspector)).all()}
+                for u in raw_users:
+                    em = str(u.get("email", "")).strip().lower()
+                    if em in db_users_map and not u.get("password_hash"):
+                        u["password_hash"] = db_users_map[em]
         else:
             backup_data = build_full_backup_dict(db)
 
-        content = json.dumps(backup_data, ensure_ascii=False, indent=2)
+        # Шифрование AES-256 при наличии запроса
+        if is_enc:
+            raw_bytes = json.dumps(backup_data, ensure_ascii=False, indent=2).encode("utf-8")
+            enc_dict = encrypt_data_aes256(raw_bytes, payload.passphrase.strip())
+            file_content = json.dumps(enc_dict, ensure_ascii=False, indent=2)
+        else:
+            file_content = json.dumps(backup_data, ensure_ascii=False, indent=2)
+
         with open(filepath, "w", encoding="utf-8") as f:
-            f.write(content)
+            f.write(file_content)
 
         size_bytes = os.path.getsize(filepath)
 
@@ -433,6 +548,8 @@ def create_server_backup(
             "message": "Резервная копия успешно сохранена в хранилище Docker на сервере",
             "filename": filename,
             "filepath": filepath,
+            "encrypted": is_enc,
+            "algorithm": "AES-256-GCM" if is_enc else None,
             "size_bytes": size_bytes,
             "size_formatted": format_file_size(size_bytes),
             "created_at": datetime.utcnow().isoformat()
@@ -456,7 +573,7 @@ def get_server_backups_list(
                 continue
 
             lower_fn = fn.lower()
-            if not (lower_fn.endswith(".json") or lower_fn.endswith(".sql.gz") or lower_fn.endswith(".dump")):
+            if not (lower_fn.endswith(".json") or lower_fn.endswith(".sql.gz") or lower_fn.endswith(".dump") or lower_fn.endswith(".enc")):
                 continue
 
             stat = os.stat(full_path)
@@ -467,13 +584,29 @@ def get_server_backups_list(
             if lower_fn.endswith(".sql.gz") or lower_fn.endswith(".dump"):
                 b_type = "sql"
 
+            # Проверка, зашифрован ли файл
+            is_encrypted = lower_fn.endswith(".enc.json") or lower_fn.endswith(".enc")
+            algo = "AES-256-GCM" if is_encrypted else None
+
+            if not is_encrypted and lower_fn.endswith(".json") and size_bytes < 50000:
+                try:
+                    with open(full_path, "r", encoding="utf-8") as tf:
+                        snippet = json.load(tf)
+                        if is_aes256_encrypted(snippet):
+                            is_encrypted = True
+                            algo = snippet.get("algorithm", "AES-256-GCM")
+                except Exception:
+                    pass
+
             items.append({
                 "filename": fn,
                 "size_bytes": size_bytes,
                 "size_formatted": format_file_size(size_bytes),
                 "created_at": created_dt.strftime("%Y-%m-%d %H:%M:%S"),
                 "timestamp": stat.st_mtime,
-                "type": b_type
+                "type": b_type,
+                "encrypted": is_encrypted,
+                "algorithm": algo
             })
 
         # Сортируем: самые свежие сверху
@@ -489,31 +622,53 @@ def get_server_backups_list(
         raise HTTPException(status_code=500, detail=f"Ошибка чтения списка бэкапов с сервера: {str(e)}")
 
 
+class ServerRestoreRequest(BaseModel):
+    passphrase: Optional[str] = None
+    mode: Optional[str] = "replace"
+
+
 @router.post("/server-restore/{filename}")
 def restore_from_server_backup(
     filename: str,
+    payload_body: Optional[ServerRestoreRequest] = None,
     db: Session = Depends(get_db),
     current_user: Inspector = Depends(require_roles(RoleEnum.admin))
 ):
     """Восстановление базы данных из резервной копии, хранящейся в Docker на сервере."""
-    safe_filename = os.path.basename(filename)
+    safe_filename = os.path.basename(unquote(filename))
     filepath = os.path.join(BACKUP_DIR, safe_filename)
 
     if not os.path.isfile(filepath):
         raise HTTPException(status_code=404, detail=f"Файл бэкапа '{safe_filename}' не найден в хранилище Docker")
 
+    mode = (payload_body.mode if payload_body and payload_body.mode else "replace").lower()
+
     try:
-        if safe_filename.lower().endswith(".json"):
+        lower_name = safe_filename.lower()
+        if lower_name.endswith(".json") or lower_name.endswith(".enc"):
             with open(filepath, "r", encoding="utf-8") as f:
                 payload = json.load(f)
 
+            # Если бэкап зашифрован AES-256
+            if is_aes256_encrypted(payload):
+                passphrase = (payload_body.passphrase if payload_body else None)
+                if not passphrase:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Резервная копия зашифрована алгоритмом AES-256. Введите пароль для расшифрования."
+                    )
+                try:
+                    decrypted_bytes = decrypt_data_aes256(payload, passphrase.strip())
+                    payload = json.loads(decrypted_bytes.decode("utf-8"))
+                except ValueError as ve:
+                    raise HTTPException(status_code=400, detail=str(ve))
+
             db_data = payload.get("database") if isinstance(payload.get("database"), dict) else payload
-            res = restore_data_from_dict(db_data, db)
+            res = restore_data_from_dict(db_data, db, mode=mode)
             res["source_file"] = safe_filename
             return res
 
-        elif safe_filename.lower().endswith(".sql.gz"):
-            # Если это SQL дамп из pg_dump, запускаем восстановление через psql/gunzip
+        elif lower_name.endswith(".sql.gz"):
             cmd = f"gunzip -c '{filepath}' | psql -h db -U postgres -d pozhnadzor"
             env = os.environ.copy()
             env["PGPASSWORD"] = os.getenv("POSTGRES_PASSWORD", "postgres_secure_pass_2026")
@@ -526,9 +681,47 @@ def restore_from_server_backup(
             }
         else:
             raise HTTPException(status_code=400, detail="Неподдерживаемый формат файла бэкапа")
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Ошибка восстановления из файла '{safe_filename}': {str(e)}")
+
+
+def _send_backup_file_response(safe_filename: str) -> Response:
+    filepath = os.path.join(BACKUP_DIR, safe_filename)
+    if not os.path.isfile(filepath):
+        raise HTTPException(status_code=404, detail="Файл бэкапа не найден в хранилище Docker")
+
+    with open(filepath, "rb") as f:
+        data = f.read()
+
+    lower_name = safe_filename.lower()
+    if lower_name.endswith(".json"):
+        media_type = "application/json; charset=utf-8"
+    elif lower_name.endswith(".sql.gz"):
+        media_type = "application/gzip"
+    else:
+        media_type = "application/octet-stream"
+
+    safe_ascii_name = safe_filename.encode("ascii", "ignore").decode("ascii") or "backup_download.json"
+    headers = {
+        "Content-Disposition": f'attachment; filename="{safe_ascii_name}"; filename*=UTF-8\'\'{quote(safe_filename)}',
+        "Access-Control-Expose-Headers": "Content-Disposition",
+        "Content-Length": str(len(data))
+    }
+    return Response(content=data, media_type=media_type, headers=headers)
+
+
+@router.get("/server-backups/download")
+def download_server_backup_query(
+    filename: str = Query(..., description="Имя файла бэкапа для скачивания"),
+    current_user: Inspector = Depends(require_roles(RoleEnum.admin))
+):
+    """Скачивание файла бэкапа из Docker на ПК администратора через Query-параметр (наиболее надежно)."""
+    safe_filename = os.path.basename(unquote(filename).strip())
+    return _send_backup_file_response(safe_filename)
 
 
 @router.get("/server-backups/{filename}/download")
@@ -536,24 +729,9 @@ def download_server_backup(
     filename: str,
     current_user: Inspector = Depends(require_roles(RoleEnum.admin))
 ):
-    """Скачивание файла бэкапа из Docker на сервере на ПК администратора."""
-    safe_filename = os.path.basename(filename)
-    filepath = os.path.join(BACKUP_DIR, safe_filename)
-
-    if not os.path.isfile(filepath):
-        raise HTTPException(status_code=404, detail="Файл бэкапа не найден")
-
-    with open(filepath, "rb") as f:
-        data = f.read()
-
-    media_type = "application/json" if safe_filename.endswith(".json") else "application/gzip"
-    return Response(
-        content=data,
-        media_type=media_type,
-        headers={
-            "Content-Disposition": f'attachment; filename="{safe_filename}"'
-        }
-    )
+    """Скачивание файла бэкапа из Docker на ПК администратора через Path-параметр."""
+    safe_filename = os.path.basename(unquote(filename).strip())
+    return _send_backup_file_response(safe_filename)
 
 
 @router.delete("/server-backups/{filename}")
@@ -562,7 +740,7 @@ def delete_server_backup(
     current_user: Inspector = Depends(require_roles(RoleEnum.admin))
 ):
     """Удаление файла резервной копии из хранилища Docker на сервере."""
-    safe_filename = os.path.basename(filename)
+    safe_filename = os.path.basename(unquote(filename).strip())
     filepath = os.path.join(BACKUP_DIR, safe_filename)
 
     if not os.path.isfile(filepath):
@@ -575,16 +753,44 @@ def delete_server_backup(
         raise HTTPException(status_code=500, detail=f"Не удалось удалить файл: {str(e)}")
 
 
+class RestorePayload(BaseModel):
+    database: Optional[Dict[str, Any]] = None
+    passphrase: Optional[str] = None
+    mode: Optional[str] = "replace"
+
+    class Config:
+        extra = "allow"
+
+
 @router.post("/restore")
 def restore_database_backup(
     payload: Dict[str, Any],
     db: Session = Depends(get_db),
     current_user: Inspector = Depends(require_roles(RoleEnum.admin))
 ):
-    """Восстановление базы данных из переданного JSON (с ПК администратора)."""
+    """Восстановление базы данных из переданного JSON (с ПК администратора, с поддержкой AES-256)."""
     try:
+        mode = str(payload.get("mode", "replace")).lower()
+
+        # Проверка на шифрование AES-256
+        if is_aes256_encrypted(payload):
+            passphrase = payload.get("passphrase")
+            if not passphrase:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Файл бэкапа зашифрован алгоритмом AES-256. Введите пароль для расшифрования."
+                )
+            try:
+                decrypted_bytes = decrypt_data_aes256(payload, str(passphrase).strip())
+                payload = json.loads(decrypted_bytes.decode("utf-8"))
+            except ValueError as ve:
+                raise HTTPException(status_code=400, detail=str(ve))
+
         db_data = payload.get("database") if isinstance(payload.get("database"), dict) else payload
-        return restore_data_from_dict(db_data, db)
+        return restore_data_from_dict(db_data, db, mode=mode)
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Ошибка восстановления базы данных: {str(e)}")
