@@ -1,7 +1,7 @@
 import os
 import json
 import subprocess
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel
@@ -35,6 +35,73 @@ def format_file_size(size_bytes: int) -> str:
         return f"{size_bytes / 1024:.1f} КБ"
     else:
         return f"{size_bytes / (1024 * 1024):.2f} МБ"
+
+
+def parse_date_safe(val: Any) -> date:
+    """Безопасный парсинг даты из JSON с поддержкой различных форматов."""
+    if not val:
+        return date.today()
+    if isinstance(val, date) and not isinstance(val, datetime):
+        return val
+    if isinstance(val, datetime):
+        return val.date()
+    val_str = str(val).strip()
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(val_str.split("T")[0], fmt).date()
+        except Exception:
+            pass
+    return date.today()
+
+
+def parse_equipment_status(st_str: Any) -> EquipmentStatusEnum:
+    """Безопасное преобразование статуса оборудования из JSON в EquipmentStatusEnum."""
+    if not st_str:
+        return EquipmentStatusEnum.active
+    s = str(st_str).strip().lower()
+    if s in ("active", "operational", "исправен", "в работе", "работает"):
+        return EquipmentStatusEnum.active
+    if s in ("repair", "maintenance", "требует ремонта", "в ремонте", "ремонт"):
+        return EquipmentStatusEnum.repair
+    if s in ("written_off", "списан", "списано", "утилизирован"):
+        return EquipmentStatusEnum.written_off
+    if s in ("inspecting", "inspection", "на проверке", "проверка"):
+        return EquipmentStatusEnum.inspecting
+    for st in EquipmentStatusEnum:
+        if st.value.lower() == s or st.name.lower() == s:
+            return st
+    return EquipmentStatusEnum.active
+
+
+def parse_risk_level(risk_str: Any) -> RiskLevelEnum:
+    """Безопасное преобразование категории риска из JSON в RiskLevelEnum."""
+    if not risk_str:
+        return RiskLevelEnum.medium
+    s = str(risk_str).strip().lower()
+    if "высок" in s or "high" in s:
+        return RiskLevelEnum.high
+    if "значит" in s or "significant" in s:
+        return RiskLevelEnum.significant
+    if "средн" in s or "medium" in s:
+        return RiskLevelEnum.medium
+    if "умерен" in s or "moderate" in s:
+        return RiskLevelEnum.moderate
+    if "низк" in s or "low" in s:
+        return RiskLevelEnum.low
+    for r in RiskLevelEnum:
+        if r.value.lower() == s or r.name.lower() == s:
+            return r
+    return RiskLevelEnum.medium
+
+
+def parse_inspection_result(res_str: Any) -> InspectionResultEnum:
+    """Безопасное преобразование результата проверки из JSON в InspectionResultEnum."""
+    if not res_str:
+        return InspectionResultEnum.passed
+    s = str(res_str).strip().lower()
+    if "не пройд" in s or "failed" in s or "нарушен" in s:
+        return InspectionResultEnum.failed
+    return InspectionResultEnum.passed
 
 
 def build_full_backup_dict(db: Session) -> Dict[str, Any]:
@@ -168,12 +235,7 @@ def restore_data_from_dict(db_data: Dict[str, Any], db: Session) -> Dict[str, An
         if not f_name:
             continue
 
-        risk_str = str(f.get("risk_level", "Средний"))
-        risk_val = RiskLevelEnum.medium
-        for rk in RiskLevelEnum:
-            if rk.value.lower() == risk_str.lower() or rk.name.lower() == risk_str.lower():
-                risk_val = rk
-                break
+        risk_val = parse_risk_level(f.get("risk_level"))
 
         existing_fac = db.scalar(select(Facility).where(Facility.name == f_name))
         if existing_fac:
@@ -200,24 +262,34 @@ def restore_data_from_dict(db_data: Dict[str, Any], db: Session) -> Dict[str, An
 
     db.commit()
 
+    # Опорный объект на случай, если у оборудования нет объекта
+    fallback_fac = db.scalars(select(Facility)).first()
+    if not fallback_fac and raw_equipment:
+        fallback_fac = Facility(
+            name="Главный объект инфраструктуры",
+            address="г. Новосибирск",
+            risk_level=RiskLevelEnum.medium
+        )
+        db.add(fallback_fac)
+        db.commit()
+        db.refresh(fallback_fac)
+
     # 3. Восстановление оборудования и СИЗ
     restored_eq_count = 0
     for e in raw_equipment:
-        eq_name = e.get("name")
-        if not eq_name:
-            continue
+        eq_name = e.get("name") or e.get("type") or "Оборудование ПБ"
 
         orig_fac_id = e.get("facility_id")
         mapped_fac_id = facility_id_map.get(orig_fac_id, orig_fac_id)
-        if mapped_fac_id and not db.get(Facility, mapped_fac_id):
-            mapped_fac_id = None
+        if not mapped_fac_id or not db.get(Facility, mapped_fac_id):
+            mapped_fac_id = fallback_fac.id if fallback_fac else None
 
-        st_str = str(e.get("status", "Исправен"))
-        st_val = EquipmentStatusEnum.operational
-        for st in EquipmentStatusEnum:
-            if st.value.lower() == st_str.lower() or st.name.lower() == st_str.lower():
-                st_val = st
-                break
+        if not mapped_fac_id:
+            continue
+
+        st_val = parse_equipment_status(e.get("status"))
+        last_check = parse_date_safe(e.get("last_check_date"))
+        next_check = parse_date_safe(e.get("next_check_date")) if e.get("next_check_date") else None
 
         new_eq = Equipment(
             facility_id=mapped_fac_id,
@@ -225,12 +297,17 @@ def restore_data_from_dict(db_data: Dict[str, Any], db: Session) -> Dict[str, An
             type=e.get("type", "Первичные средства пожаротушения"),
             serial_number=e.get("serial_number"),
             status=st_val,
+            last_check_date=last_check,
+            next_check_date=next_check,
             notes=e.get("notes")
         )
         db.add(new_eq)
         restored_eq_count += 1
 
     db.commit()
+
+    # Опорный инспектор на случай несовпадения ID
+    fallback_insp = db.scalars(select(Inspector)).first()
 
     # 4. Восстановление проверок
     restored_insp_count = 0
@@ -241,18 +318,24 @@ def restore_data_from_dict(db_data: Dict[str, Any], db: Session) -> Dict[str, An
         mapped_insp_id = inspector_id_map.get(orig_insp_id, orig_insp_id)
 
         if not mapped_fac_id or not db.get(Facility, mapped_fac_id):
+            mapped_fac_id = fallback_fac.id if fallback_fac else None
+
+        if not mapped_fac_id:
             continue
 
-        res_str = str(ins.get("result", "Пройдена"))
-        res_val = InspectionResultEnum.passed
-        for rk in InspectionResultEnum:
-            if rk.value.lower() == res_str.lower() or rk.name.lower() == res_str.lower():
-                res_val = rk
-                break
+        if not mapped_insp_id or not db.get(Inspector, mapped_insp_id):
+            mapped_insp_id = fallback_insp.id if fallback_insp else None
+
+        if not mapped_insp_id:
+            continue
+
+        res_val = parse_inspection_result(ins.get("result"))
+        insp_date = parse_date_safe(ins.get("date"))
 
         new_insp = Inspection(
             facility_id=mapped_fac_id,
-            inspector_id=mapped_insp_id if mapped_insp_id and db.get(Inspector, mapped_insp_id) else None,
+            inspector_id=mapped_insp_id,
+            date=insp_date,
             result=res_val,
             prescription_number=ins.get("prescription_number"),
             violations=ins.get("violations")

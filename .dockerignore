@@ -1,10 +1,32 @@
+# Зависимости и сборка
 node_modules
-.git
-.gitignore
 dist
 build
-.vscode
-*.log
-.env*
 coverage
+
+# Резервные копии и дампы (КРИТИЧНО для скорости сборки Docker!)
+backups
+*.sql
+*.sql.gz
+*.tar
+*.gz
+*.zip
+
+# Backend и сервисы (не нужны в контексте сборки фронтенда)
+backend
+docker-backup
+scripts
+
+# Конфиденциальные данные и логи
+.env*
+*.log
+auth_debug.txt
+project_dump.txt
+smtp.config.json
+
+# Git и редакторы
+.git
+.gitignore
+.vscode
+.idea
 .DS_Store
