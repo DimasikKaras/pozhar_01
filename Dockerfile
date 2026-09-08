@@ -11,6 +11,13 @@ ENV NODE_OPTIONS="--max-old-space-size=1024"
 RUN npm run build
 
 FROM nginx:alpine
+RUN apk add --no-cache openssl && \
+    mkdir -p /etc/nginx/ssl && \
+    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+      -keyout /etc/nginx/ssl/selfsigned.key \
+      -out /etc/nginx/ssl/selfsigned.crt \
+      -subj "/C=RU/ST=Novosibirsk/L=Novosibirsk/O=MCHS/OU=GPN/CN=pozhnadzor.local"
+
 COPY --from=build /app/dist /usr/share/nginx/html
 EXPOSE 80 443
 CMD ["nginx", "-g", "daemon off;"]
